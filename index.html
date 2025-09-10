@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Product Viewer — GLB | WebXR (VR+AR) | USDZ</title>
+    <meta name="description" content="React + Three.js product viewer supporting GLB, WebXR (VR+AR), and iOS Quick Look (USDZ) fallback." />
+    <link rel="icon" href="/favicon.svg" />
+    <style>
+      :root {
+        --bg: #ffffff;
+        --ink: #0b1220;
+        --muted: #5b6373;
+        --line: #e9eef5;
+        --panel: #f7fafc;
+        --accent: #ff6a00;
+        --accent-ink: #ffffff;
+        --accent-soft: #fff0e6;
+      }
+
+      /* Allow page to scroll */
+      html, body, #root { min-height: 100%; margin: 0; overflow-y: auto; }
+      .viewer { position: fixed; inset: 0; z-index: 0; }
+        .vh { min-height: 100vh; }
+      body {
+        background: var(--bg);
+        color: var(--ink);
+        font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, Segoe UI, Inter, Roboto, sans-serif;
+      }
+
+      /* Layout: viewer fixed behind scrollable content */
+      .app { position: relative; min-height: 100%; }
+      .viewer { position: fixed; inset: 0; z-index: 0; }
+      canvas { position: absolute; inset: 0; display: block; }
+
+      .sections { position: relative; z-index: 1; }
+      .vh {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: clamp(16px, 5vw, 96px);
+        pointer-events: none;
+      }
+      .section-inner {
+        background: rgba(255,255,255,0.75);
+        border: 1px solid var(--line);
+        backdrop-filter: blur(8px);
+        border-radius: 16px;
+        padding: clamp(16px, 3vw, 32px);
+        max-width: min(820px, 86vw);
+        box-shadow: 0 10px 40px rgba(0,0,0,0.06);
+        pointer-events: none;
+      }
+      .vh h2 { margin: 0 0 6px; font-size: clamp(24px, 5vw, 42px); }
+      .vh p { color: var(--muted); margin: 0; }
+
+      /* Right utilities panel (kept off by default) */
+      .ui {
+        width: 360px;
+        max-width: 36vw;
+        padding: 16px;
+        border-left: 1px solid var(--line);
+        background: var(--panel);
+        overflow: auto;
+        display: none;
+      }
+      .ui h1 { font-size: 16px; margin: 0 0 12px; color: var(--ink); }
+      .ui section { margin-bottom: 14px; }
+      .ui label { display: block; margin: 6px 0 4px; color: var(--muted); }
+      .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      input[type='range'] { width: 100%; }
+      .btn {
+        appearance: none; border: 1px solid var(--line); padding: 8px 10px; border-radius: 10px;
+        background: #fff; color: var(--ink); cursor: pointer;
+        transition: box-shadow .15s ease, transform .15s ease;
+      }
+      .btn:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(0,0,0,.08); }
+      .btn[disabled] { opacity: 0.55; cursor: not-allowed; }
+      .muted { color: var(--muted); font-size: 12px; }
+      .drop { border: 1px dashed var(--line); border-radius: 12px; padding: 12px; text-align: center; background: #fff; }
+      a.link { color: #155eef; text-decoration: none; }
+      .badge {
+        display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border-radius: 999px;
+        background: var(--accent-soft); border: 1px solid #ffd1b3; color: #c24b00; font-size: 12px;
+      }
+      .badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+
+      /* HUD overlay on top of WebGL */
+      .canvas-overlay { position: absolute; inset: 0; z-index: 2; pointer-events: none; }
+      .overlay-topbar {
+        position: absolute; top: 20px; left: 20px;
+        display: flex; align-items: center; gap: 12px;
+        pointer-events: auto;
+      }
+      .brand { display: flex; align-items: center; gap: 10px; }
+      .brand img { width: 28px; height: 28px; border-radius: 8px; }
+      .brand span { font-weight: 700; letter-spacing: 0.2px; color: var(--ink); }
+
+      .hud {
+        position: absolute;
+        left: clamp(20px, 4vw, 48px);
+        top: clamp(80px, 16vh, 160px);
+        max-width: min(720px, 56vw);
+        pointer-events: auto;
+      }
+      .hud .eyebrow {
+        font-size: 12px; text-transform: uppercase; letter-spacing: 0.18em; color: #a74a00;
+        background: var(--accent-soft); display: inline-block; padding: 6px 10px;
+        border-radius: 999px; border: 1px solid #ffd1b3;
+      }
+      .hud .title { margin: 10px 0 6px; font-size: clamp(28px, 5vw, 56px); line-height: 1.06; color: var(--ink); }
+      .hud .sub { color: var(--muted); font-size: clamp(13px, 1.6vw, 16px); max-width: 60ch; }
+      .cta-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+      .chip {
+        pointer-events: auto; cursor: pointer; display: inline-flex; align-items: center; gap: 8px;
+        padding: 10px 14px; border-radius: 999px; border: 1px solid var(--line); background: #fff; color: var(--ink);
+        transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+      }
+      .chip:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(0,0,0,0.08); }
+      .chip.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+      .chip svg { width: 16px; height: 16px; display: block; }
+
+      .tool-rail {
+        position: absolute; right: 20px; top: 50%; transform: translateY(-50%);
+        display: flex; flex-direction: column; gap: 10px; pointer-events: auto;
+      }
+      .icon-btn {
+        width: 42px; height: 42px; border-radius: 50%;
+        background: #fff; border: 1px solid var(--line);
+        display: grid; place-items: center; cursor: pointer;
+        transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+      }
+      .icon-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 16px rgba(0,0,0,0.08); }
+      .icon-btn svg { width: 18px; height: 18px; stroke: var(--ink); }
+      .icon-btn.accent { background: var(--accent); border-color: var(--accent); }
+      .icon-btn.accent svg { stroke: #fff; }
+
+      .hint {
+        position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%);
+        pointer-events: none; color: var(--muted); font-size: 12px;
+        background: #fff; border: 1px solid var(--line); padding: 6px 10px; border-radius: 999px;
+      }
+
+      .canvas-footer {
+        position: absolute; left: 20px; bottom: 24px; pointer-events: auto;
+        color: var(--muted); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap;
+      }
+      .canvas-footer b { color: var(--ink); }
+
+      .sr-only {
+        position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+        clip: rect(0, 0, 0, 0); border: 0;
+      }
+
+      @media (min-width: 1280px) { .ui { display: block; } }
+      @media (max-width: 1024px) {
+        .hud { left: 16px; top: 18vh; max-width: 88vw; }
+        .hud .title { font-size: clamp(24px, 7vw, 36px); }
+        .overlay-topbar { top: 12px; left: 12px; }
+        .canvas-footer { left: 12px; bottom: 12px; font-size: 11px; gap: 10px; }
+        .hint { display: none; }
+      }
+      @media (max-width: 768px) {
+        .tool-rail {
+          left: 50%; right: auto; top: auto; bottom: 16px;
+          transform: translateX(-50%);
+          flex-direction: row; gap: 12px;
+        }
+        .icon-btn { width: 52px; height: 52px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
