@@ -25,8 +25,8 @@ const DEFAULT_MODEL_URL = `${BASE}assets/bed.glb`
 const DRACO_PATH = `${BASE}draco/`
 
 // Tweakables for initial zoom
-const INITIAL_FRAME_PADDING = 1.20   // larger = farther, smaller = closer
-const INITIAL_ZOOM_FACTOR   = 2.5   // optional post-fit nudge (<1 in, >1 out), 1=disabled
+const INITIAL_FRAME_PADDING = 2.5   // larger = farther, smaller = closer
+const INITIAL_ZOOM_FACTOR   = 5   // optional post-fit nudge (<1 in, >1 out), 1=disabled
 
 export type InitOptions = {
   scrollScrub?: boolean
@@ -831,7 +831,7 @@ async function loadGLB(fileOrUrl: File | string) {
 
         // One-time fit to view using centered pivot
         fitCameraToObject(pivot!, INITIAL_FRAME_PADDING)
-        if (INITIAL_ZOOM_FACTOR !== 2.5) dollyScaleSmooth(INITIAL_ZOOM_FACTOR, 0)
+        if (INITIAL_ZOOM_FACTOR !== 5) dollyScaleSmooth(INITIAL_ZOOM_FACTOR, 0)
 
         // Animations
         if (gltf.animations && gltf.animations.length) {

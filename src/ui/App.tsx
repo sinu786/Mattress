@@ -14,6 +14,12 @@ export default function App() {
   const [autoRotate, setAutoRotate] = useState(true)
   const [usdzHref, setUsdzHref] = useState('')
 
+  // Loading/boot states
+  const [booting, setBooting] = useState(true)            // viewer init blur
+  const [modelLoading, setModelLoading] = useState(false) // GLB load blur
+  const [loadPct, setLoadPct] = useState<number | null>(null) // null = indeterminate
+  const progTimer = useRef<number | null>(null)
+
   // Named sections (derived from part names: “sec 1|se 2|section 3”)
   const [namedParts, setNamedParts] = useState<NamedPart[]>([])
   const [stage, setStage] = useState(0) // 0: assembled, 1: exploded, 2+: per-named-part
@@ -37,6 +43,9 @@ export default function App() {
       const initViewer = viewerModule.initViewer as (el: HTMLElement, opts?: InitOptions) => Promise<ViewerHandle>
       const disposeViewer = viewerModule.disposeViewer as (h: ViewerHandle) => void
 
+      // show boot blur immediately
+      setBooting(true)
+
       const h = await initViewer(mountRef.current!, {
         showHDRIBackground: false,
         enableShadows: true,
@@ -52,6 +61,11 @@ export default function App() {
       h.setExplode(0)
       h.isolateIndex(null)
       h.setOrbitTargetTo(null)
+
+      // allow one paint before removing boot blur for a nicer feel
+      requestAnimationFrame(() => {
+        setTimeout(() => setBooting(false), 120)
+      })
 
       cleanup = () => disposeViewer(h)
     })()
@@ -203,10 +217,39 @@ export default function App() {
     }
   }
 
+  // --- Loading bar helpers (simulated progress until Promise resolves)
+  function startProgress(indeterminate = true) {
+    setModelLoading(true)
+    setLoadPct(indeterminate ? null : 0)
+    if (progTimer.current) {
+      window.clearInterval(progTimer.current)
+      progTimer.current = null
+    }
+    // gentle fake progress that stalls around 90% until finish
+    let p = 0
+    progTimer.current = window.setInterval(() => {
+      p = Math.min(90, p + 2 + Math.random() * 6)
+      setLoadPct(prev => (prev === null ? null : p))
+    }, 120) as unknown as number
+  }
+  function finishProgress() {
+    if (progTimer.current) {
+      window.clearInterval(progTimer.current)
+      progTimer.current = null
+    }
+    setLoadPct(prev => (prev === null ? null : 100))
+    // slight delay for a satisfying completion flash
+    setTimeout(() => {
+      setModelLoading(false)
+      setLoadPct(null)
+    }, 260)
+  }
+
   // loaders / DnD
   async function onPickGLB(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0]; if (!f || !handle) return
     setStatus('Loading model…')
+    startProgress(true) // we don’t have per-byte progress here; show indeterminate
     try {
       await handle.loadGLB(f)
       const names = handle.getPartNames?.() ?? []
@@ -217,7 +260,7 @@ export default function App() {
       handle.setOrbitTargetTo(null)
       setStatus('Model loaded.')
     } catch (err: unknown) { console.error(err); setStatus('Failed to load model.') }
-    finally { e.target.value = '' }
+    finally { e.target.value = ''; finishProgress() }
   }
 
   function onDrop(ev: React.DragEvent<HTMLDivElement>) {
@@ -225,7 +268,9 @@ export default function App() {
     const file = ev.dataTransfer.files?.[0]; if (!file || !handle) return
     const name = file.name.toLowerCase()
     setStatus('Loading model…')
+
     if (name.endsWith('.glb') || name.endsWith('.gltf')) {
+      startProgress(true)
       handle.loadGLB(file).then(() => {
         const names = handle.getPartNames?.() ?? []
         setNamedParts(parseNamedParts(names))
@@ -235,6 +280,7 @@ export default function App() {
         handle.setOrbitTargetTo(null)
         setStatus('Model loaded.')
       }).catch((err: unknown) => { console.error(err); setStatus('Failed to load model.') })
+        .finally(() => finishProgress())
     } else if (name.endsWith('.usdz')) {
       const url = URL.createObjectURL(file); setUsdzHref(url); setStatus('USDZ ready for iOS Quick Look.')
     } else setStatus('Unsupported file. Drop a .glb/.gltf or .usdz.')
@@ -276,6 +322,8 @@ export default function App() {
   // Stage copy (title + subtitle) with smooth change
   const { titleText, subText } = getStageCopy(stage, namedParts)
 
+  const showLoading = booting || modelLoading
+
   return (
     <div className="app">
       {/* Scoped styles */}
@@ -297,6 +345,10 @@ export default function App() {
     --line: #e9eef5;
     --accent: #ff6a00;
     --accent-ink: #ffffff;
+
+    --blur-strength: 10px;
+    --glass-bg: rgba(255,255,255,0.55);
+    --glass-border: rgba(255,255,255,0.6);
   }
 
   /* ===== Dock (desktop + mobile) ===== */
@@ -442,6 +494,57 @@ export default function App() {
     font-size: 12px; color: var(--muted);
     z-index: 4; pointer-events: none;
   }
+
+  /* ===== Loading Scrim (blur + bar) ===== */
+  .loading-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 7;
+    display: grid;
+    place-items: center;
+    background: rgba(255,255,255,0.35);
+    -webkit-backdrop-filter: blur(var(--blur-strength)) saturate(160%);
+    backdrop-filter: blur(var(--blur-strength)) saturate(160%);
+    transition: opacity .24s ease;
+  }
+  .loading-card {
+    pointer-events: none;
+    min-width: min(82vw, 440px);
+    border-radius: 16px;
+    padding: 18px 18px 14px;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    box-shadow: 0 24px 70px rgba(0,0,0,0.18);
+  }
+  .loading-title {
+    font-size: 14px;
+    margin-bottom: 10px;
+    color: var(--ink);
+  }
+  .progress {
+    position: relative;
+    height: 8px;
+    border-radius: 999px;
+    background: #eef3f9;
+    overflow: hidden;
+    border: 1px solid #e2e8f0;
+  }
+  .progress-fill {
+    position: absolute; top: 0; left: 0; height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #ff6a00 0%, #ffa04f 100%);
+    transition: width .18s ease;
+  }
+  .progress[data-indeterminate="true"]::before {
+    content: "";
+    position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent 0%, rgba(0,0,0,0.06) 50%, transparent 100%);
+    transform: translateX(-100%);
+    animation: indet 1.1s linear infinite;
+  }
+  @keyframes indet {
+    to { transform: translateX(100%); }
+  }
 `}</style>
 
       {/* Viewer */}
@@ -464,7 +567,6 @@ export default function App() {
               <h1 className="title">{titleText}</h1>
               <p className="sub">
                 {subText}
-                {/* Instruction line must remain unchanged */}
                 {' '}• Pinch to zoom • Drag to orbit • Use wheel / swipe to move through stages.
               </p>
             </div>
@@ -541,6 +643,23 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* Loading Scrim (boots + model loads) */}
+      {showLoading && (
+        <div className="loading-scrim" aria-busy="true" aria-live="polite">
+          <div className="loading-card">
+            <div className="loading-title">
+              {booting ? 'Loading app' : (status || 'Loading model…')}
+            </div>
+            <div className="progress" data-indeterminate={loadPct === null || Number.isNaN(loadPct) ? 'true' : 'false'}>
+              <div
+                className="progress-fill"
+                style={{ width: loadPct && loadPct > 0 ? `${Math.min(100, loadPct)}%` : '0%' }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Hidden utilities */}
       <div style={{ display: 'none' }}>
