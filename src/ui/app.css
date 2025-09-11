@@ -1,0 +1,179 @@
+/* src/ui/app.css */
+
+/* ========== Theme ========== */
+:root{
+    --ink:#494949;
+    --muted:#a6b0c2;
+    --line:rgba(255,255,255,.10);
+  
+    --accent:#ffd2aa;      /* orange */
+    --accent-soft:#f9d67a; /* soft gold */
+    --accent-ink:#0b0f17;
+  
+    --bg0:#0b0f17;         /* deep slate */
+    --bg1:#111827;         /* elevated */
+  
+    --blur:14px;
+    --r-sm:10px; --r-md:16px; --r-lg:22px; --r-pill:999px;
+  
+    --e1:0 6px 20px rgba(0,0,0,.22);
+    --e2:0 14px 40px rgba(0,0,0,.26);
+    --e3:0 24px 70px rgba(0,0,0,.34);
+  }
+  
+  /* ========== App / Canvas ========== */
+  html, body, #root { width:100%; height:100%; margin:0; }
+  .app-root { width:100%; height:100%; color:var(--ink); overflow:hidden;
+    background:
+      radial-gradient(900px 600px at 68% 18%, rgba(255,255,255,.06), transparent 60%),
+      radial-gradient(1400px 900px at -10% -20%, #121a29 0%, var(--bg0) 55%);
+  }
+  .viewer { position:fixed; inset:0; }
+  
+  /* Subtle foot glow (brand-matched) */
+  .viewer::after{
+    content:"";
+    position:absolute; inset:auto 0 16% 0; margin:auto;
+    width:min(60vw,540px); height:200px; border-radius:50%;
+    background: radial-gradient(60% 60% at 50% 50%, rgba(255,155,68,.25), transparent 70%);
+    filter: blur(28px);
+    pointer-events:none; z-index:1;
+  }
+  
+  /* Overlay root (don’t block orbit by default) */
+  .canvas-overlay { position:absolute; inset:0; z-index:2; pointer-events:none; }
+  
+  /* ========== Top-right Brand Chip ========== */
+  .overlay-topbar { position:absolute; top:14px; left:14px; right:14px; display:flex; justify-content:flex-end; }
+  
+  /* ========== Hero (left headline) ========== */
+/* HUD text */
+.hud {
+    position: absolute;
+    top: 84px;
+    left: 36px;
+    right: auto;
+    max-width: min(720px, 90vw);
+    text-align: left;
+    pointer-events: none;
+  }
+  
+  /* Smooth headline */
+  .headline-anim {
+    animation: fadeSlide .36s ease both;
+  }
+  @keyframes fadeSlide {
+    from {opacity:0; transform:translateY(8px)}
+    to {opacity:1; transform:translateY(0)}
+  }
+  
+  /* Mobile overrides */
+  @media (max-width: 900px) {
+    .hud {
+      top: 66px;
+      left: 14px;
+      right: 14px;
+      max-width: 100%;
+    }
+  }
+  .eyebrow{
+    display:inline-block;
+    font-size:12px; text-transform:uppercase; letter-spacing:.18em;
+    color:#1e2431;
+    background: rgba(249,214,122,.22);
+    border:1px solid rgba(249,214,122,.40);
+    padding:8px 12px; border-radius:999px;
+  }
+  .title{
+    margin:16px 0 10px;
+    font-weight:800; letter-spacing:-.02em;
+    font-size: clamp(28px, 6.6vw, 68px);
+    line-height:1.02; color:var(--ink);
+    text-wrap: balance;
+  }
+  .sub{ color:var(--muted); font-size: clamp(14px,1.2vw,18px); max-width:56ch; }
+  .headline-anim{ animation: heroFade .36s ease both; }
+  @keyframes heroFade{ from{opacity:0; transform:translateY(8px)} to{opacity:1; transform:none} }
+  
+  /* ========== Stage Rail (hidden for clean layout) ========== */
+  .stage-rail{ display: none !important; }
+  
+  /* ========== Bottom Glass Dock ========== */
+  .tool-dock{
+    position:fixed; 
+    left:50%; 
+    transform:translateX(-50%);
+    bottom: calc(env(safe-area-inset-bottom) + 24px);
+    z-index:6; 
+    display:flex; 
+    justify-content:center;
+    gap:16px; 
+    padding:14px 18px;
+    background: rgba(13,17,27,.56);
+    border:1px solid rgba(255,255,255,.12);
+    border-radius:18px;
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    backdrop-filter: blur(14px) saturate(140%);
+    box-shadow: 0 30px 60px rgba(0,0,0,.35);
+    pointer-events:auto;
+  }
+  .dock-btn{
+    appearance:none; border:1px solid rgba(255,255,255,.14);
+    background: rgba(255,255,255,.05); color:#e6ebf6;
+    display:flex; flex-direction:row; align-items:center; justify-content:center;
+    gap:8px; padding:12px 18px; border-radius:14px; cursor:pointer;
+    font-weight:600; letter-spacing:.01em; min-width:120px;
+    transition: transform .1s ease, box-shadow .2s ease, background .15s ease, color .15s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .dock-btn:hover{ transform:translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+  .dock-btn svg{ width:18px; height:18px; }
+  .dock-label{ font-size:14px; line-height:1; white-space:nowrap; }
+  
+  .dock-btn.primary{
+    background: linear-gradient(180deg, var(--accent-soft), var(--accent));
+    color: var(--accent-ink);
+    border-color: #ffffff;
+    min-width:140px;
+  }
+  .dock-btn.primary:hover{ box-shadow: 0 10px 30px rgba(255, 176, 58, 0.35); transform:translateY(-2px); }
+  
+  /* ========== Loading Scrim ========== */
+  .loading-scrim{
+    position:fixed; inset:0; z-index:7; display:grid; place-items:center;
+    background: rgba(6,10,16,.45);
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  }
+  .loading-card{
+    pointer-events:none;
+    min-width:min(82vw, 420px);
+    border-radius:16px; padding:18px 18px 14px;
+    background: rgba(16,20,30,.7);
+    border:1px solid rgba(255,255,255,.12);
+    box-shadow: 0 24px 70px rgba(0,0,0,.4);
+    color:#eaf0ff;
+  }
+  .loading-title{ font-size:14px; margin-bottom:10px;font-family:'Courier New', Courier, monospace; }
+  .progress{ position:relative; height:8px; border-radius:999px; background: rgba(255,255,255,.08); overflow:hidden; border:1px solid rgba(255,255,255,.12); }
+  .progress-fill{ position:absolute; inset:0 auto 0 0; width:0%; background: linear-gradient(90deg, var(--accent), #ffd9a3); }
+  
+  /* ========== Mobile Tweaks ========== */
+  @media (max-width: 900px){
+    .hud{
+      top: 72px;
+      left: 16px;
+      right: 16px;
+      transform:none;
+      max-width: unset;
+    }
+    .title{ font-size: clamp(26px, 8vw, 40px); line-height:1.06; }
+    .sub{ font-size: 14px; }
+    .tool-dock{ max-width: min(92vw, 560px); padding: 10px 12px; gap: 10px; }
+    .dock-btn{ flex:1 1 0; min-width:0; padding:10px 12px; }
+  }
+  
+  /* ========== Motion Safety ========== */
+  @media (prefers-reduced-motion: reduce){
+    *{ animation:none !important; transition:none !important; }
+  }
+  
