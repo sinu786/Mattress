@@ -22,13 +22,18 @@ const DRACO_PATH = `${BASE}draco/` // ensure public/draco/* files exist
 
 // ---------- Types
 export type InitOptions = {
+  // Lighting (match mobile)
+  lightRig?: 'mobile' | 'none'      // default: 'mobile'
+  envIntensity?: number             // default: 1.15 (PBR reflections)
+  backdropColor?: number | string   // default: 0xf5f7fb
+  useACES?: boolean                 // default: true
+
   scrollScrub?: boolean
   modelUrl?: string
   hdriUrl?: string
   showHDRIBackground?: boolean
   enableShadows?: boolean
   toneMappingExposure?: number
-  // Bloom
   bloomEnabled?: boolean
   bloomThreshold?: number
   bloomStrength?: number
@@ -36,12 +41,8 @@ export type InitOptions = {
 }
 
 export type ViewerHandle = {
-  // Target by name (e.g., Blender Empty like "sec1.001")
   setOrbitTargetByName: (name: string | null, zoomScale?: number) => boolean
-  // Global blur (screen blur) controls
-  setBlur: (amountPx: number) => void          // 0 disables
-
-  // NEW: visibility mask (null = show all, list = show only those parts)
+  setBlur: (amountPx: number) => void
   setVisibleIndices: (indices: number[] | null) => void
 
   loadGLB: (fileOrUrl: File | string) => Promise<void>
@@ -51,16 +52,16 @@ export type ViewerHandle = {
   setExposure: (expo: number) => void
   setAutoRotate: (enabled: boolean) => void
   resetView: () => void
-  dolly?: (k: number) => void // k>1 zoom out, k<1 zoom in
+  dolly?: (k: number) => void
 
   // XR
   enterVR: () => Promise<void>
   enterAR: () => Promise<void>
 
   // Focus
-  setExplode: (t: number) => void               // 0 overview; 1 exploded
+  setExplode: (t: number) => void
   setOrbitTargetTo: (index: number | null) => void
-  isolateIndex: (i: number | null, dimOpacity?: number) => void // kept for other effects (unused by sections now)
+  isolateIndex: (i: number | null, dimOpacity?: number) => void
   partCount: () => number
   getPartNames: () => string[]
 
@@ -77,6 +78,9 @@ export type ViewerHandle = {
 }
 
 // ---------- Scene globals
+
+let initOpts: InitOptions = {}
+
 let renderer: THREE.WebGLRenderer | null = null
 let scene: THREE.Scene | null = null
 let camera: THREE.PerspectiveCamera | null = null
@@ -103,6 +107,9 @@ let reticle: THREE.Mesh | null = null
 
 // Studio backdrop
 let studioBackdrop: THREE.Mesh | null = null
+let studioBackdropWire: THREE.LineSegments | null = null   // NEW
+let studioBackdropWireHalo: THREE.LineSegments | null = null // NEW
+
 
 // ---------- Model / parts state (kept for isolate/focus)
 let currentModel: THREE.Object3D | null = null
@@ -123,23 +130,19 @@ let activeAction: THREE.AnimationAction | null = null
 let clipNames: string[] = []
 let clipDurations: Record<string, number> = {}
 let playbackSpeed = 1.0
-// Track whether we are logically at "overview (0)" or "exploded (1)"
 let explodeState: 0 | 1 = 0
 
 // ===== Smooth zoom config for exploded view =====
-const EXPLODED_ZOOM_FACTOR = 1.30  // amount (1.25–1.40 typical)
-const EXPLODED_ZOOM_MS = 420       // duration in ms
-
+const EXPLODED_ZOOM_FACTOR = 1.30
+const EXPLODED_ZOOM_MS = 420
 let _explodedZoomApplied = false
 let _zoomAnimRAF: number | null = null
 
 const _easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
-
 function _currentDist(): number {
   if (!camera || !controls) return 0
   return new THREE.Vector3().subVectors(camera.position, controls.target).length()
 }
-
 function _setDist(dist: number) {
   if (!camera || !controls) return
   const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize()
@@ -151,7 +154,6 @@ function _setDist(dist: number) {
   camera.updateProjectionMatrix()
   controls.update()
 }
-
 function dollyScaleSmooth(k: number, ms = 420) {
   if (!camera || !controls) return
   if (_zoomAnimRAF !== null) { cancelAnimationFrame(_zoomAnimRAF); _zoomAnimRAF = null }
@@ -168,20 +170,51 @@ function dollyScaleSmooth(k: number, ms = 420) {
   }
   _zoomAnimRAF = requestAnimationFrame(step)
 }
-
-// Smooth zoom helpers used by exploded/overview transitions
 function applyExplodedZoom() {
   if (_explodedZoomApplied) return
-  dollyScaleSmooth(EXPLODED_ZOOM_FACTOR, EXPLODED_ZOOM_MS) // smooth zoom out
+  dollyScaleSmooth(EXPLODED_ZOOM_FACTOR, EXPLODED_ZOOM_MS)
   _explodedZoomApplied = true
 }
 function clearExplodedZoom() {
   if (!_explodedZoomApplied) return
-  dollyScaleSmooth(1 / EXPLODED_ZOOM_FACTOR, EXPLODED_ZOOM_MS) // smooth zoom back
+  dollyScaleSmooth(1 / EXPLODED_ZOOM_FACTOR, EXPLODED_ZOOM_MS)
   _explodedZoomApplied = false
 }
 
 // ---------- Helpers
+function setEnvIntensity(root: THREE.Object3D, intensity: number) {
+  root.traverse((o: any) => {
+    if (!o.isMesh) return
+    const apply = (m: THREE.Material) => {
+      const std = m as any
+      if ('envMapIntensity' in std) std.envMapIntensity = intensity
+    }
+    if (Array.isArray(o.material)) o.material.forEach(apply)
+    else if (o.material) apply(o.material)
+  })
+}
+
+function addMobileLightRig() {
+  if (!scene) return
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.55)
+  hemi.position.set(0, 1, 0)
+  scene.add(hemi)
+
+  const key = new THREE.DirectionalLight(0xffffff, 1.35)
+  key.position.set(3.0, 3.2, 2.0)
+  key.castShadow = false
+  scene.add(key)
+
+  const rim = new THREE.DirectionalLight(0xffffff, 0.8)
+  rim.position.set(-2.2, 2.6, -3.2)
+  rim.castShadow = false
+  scene.add(rim)
+
+  const fill = new THREE.PointLight(0xffffff, 0.55, 0, 2)
+  fill.position.set(0, 1.1, 2.8)
+  scene.add(fill)
+}
+
 function createReticle() {
   const ringGeo = new THREE.RingGeometry(0.09, 0.1, 32).rotateX(-Math.PI / 2)
   const mat = new THREE.MeshBasicMaterial({ color: 0x66bbff })
@@ -204,16 +237,52 @@ async function loadHDRIToEnv(url: string, showBackground: boolean) {
 
 function addStudioBackdrop() {
   if (!scene) return
+  const col = (initOpts.backdropColor ?? 0xf5f7fb) as any
+
+  // Base sphere (inside-out “infinite” studio)
   const geo = new THREE.SphereGeometry(50, 64, 64)
   const mat = new THREE.MeshStandardMaterial({
-    color: 0xababab, roughness: 1.0, metalness: 0.0, side: THREE.BackSide
+    color: col,
+    roughness: 0.98,
+    metalness: 0.0,
+    side: THREE.BackSide
   })
   const mesh = new THREE.Mesh(geo, mat)
+  // Don’t write depth so overlay lines don’t z-fight and stay visible
+  ;(mesh.material as THREE.MeshStandardMaterial).depthWrite = false
   mesh.receiveShadow = false
   mesh.castShadow = false
   scene.add(mesh)
   studioBackdrop = mesh
+
+  // Wireframe overlay (thin gridlines)
+  const wireGeo = new THREE.WireframeGeometry(geo)
+  const wireMat = new THREE.LineBasicMaterial({
+    color: 0xffffff,      // soft desaturated blue/steel
+    transparent: true,
+    opacity: 1,
+    depthTest: false      // draw over the backdrop regardless of depth
+  })
+  const wire = new THREE.LineSegments(wireGeo, wireMat)
+  wire.renderOrder = -1   // behind scene content, ahead of clear color
+  scene.add(wire)
+  studioBackdropWire = wire
+
+  // “Halo” outline: same wire slightly scaled, lighter & softer
+  const haloGeo = wireGeo   // reuse geometry safely (immutable here)
+  const haloMat = new THREE.LineBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.18,
+    depthTest: false
+  })
+  const halo = new THREE.LineSegments(haloGeo, haloMat)
+  halo.scale.setScalar(1.002) // tiny expansion = soft outer rim
+  halo.renderOrder = -0.99
+  scene.add(halo)
+  studioBackdropWireHalo = halo
 }
+
 
 function normalizeImportedLights(root: THREE.Object3D) {
   root.traverse(obj => {
@@ -229,7 +298,6 @@ function normalizeImportedLights(root: THREE.Object3D) {
   })
 }
 
-// One-time fit (used on load only; we won’t move camera again on section changes)
 function fitCameraToObject(obj: THREE.Object3D, padding = 1.2) {
   if (!camera || !controls) return
   const box = new THREE.Box3().setFromObject(obj)
@@ -242,7 +310,6 @@ function fitCameraToObject(obj: THREE.Object3D, padding = 1.2) {
   const fov = THREE.MathUtils.degToRad(camera.fov)
   const dist = (maxDim / (2 * Math.tan(fov / 2))) * padding
 
-  // Keep current azimuth/elevation; move along current view dir
   const viewDir = new THREE.Vector3()
     .subVectors(camera.position, controls.target)
     .normalize()
@@ -273,7 +340,6 @@ function gatherParts(root: THREE.Object3D): THREE.Object3D[] {
   return Array.from(set)
 }
 
-// Clone once, remember baseline opacity (never 0)
 function cloneMaterials(root: THREE.Object3D) {
   root.traverse((o: any) => {
     if (!o.isMesh) return
@@ -289,11 +355,8 @@ function cloneMaterials(root: THREE.Object3D) {
       savedMatProps.set(c, { transparent: baseTransparent, opacity: baseOpacity })
       return c
     }
-    if (Array.isArray(o.material)) {
-      o.material = o.material.map(wrap)
-    } else if (o.material) {
-      o.material = wrap(o.material)
-    }
+    if (Array.isArray(o.material)) o.material = o.material.map(wrap)
+    else if (o.material) o.material = wrap(o.material)
   })
 }
 
@@ -302,7 +365,6 @@ function computeModelStats(root: THREE.Object3D) {
   bbox.getCenter(centroid)
 }
 
-// Soft isolate (kept for compatibility; not used by section flow)
 function isolatePart(index: number | null, dimOpacity = 0.01) {
   const dim = Math.max(0.08, Math.min(0.5, dimOpacity))
   parts.forEach((p, i) => {
@@ -329,7 +391,6 @@ function getPartWorldCenter(index: number, out = new THREE.Vector3()) {
   return tmp.getCenter(out)
 }
 
-// Utility: world position by object name
 function getWorldPosByName(name: string, out = new THREE.Vector3()): THREE.Vector3 | null {
   if (!scene) return null
   const obj = scene.getObjectByName(name)
@@ -339,7 +400,6 @@ function getWorldPosByName(name: string, out = new THREE.Vector3()): THREE.Vecto
   return out
 }
 
-// Utility: zoom by multiplicative scale factor around controls.target (immediate)
 function dollyScale(k: number) {
   if (!camera || !controls) return
   const dir = new THREE.Vector3().subVectors(camera.position, controls.target)
@@ -353,7 +413,6 @@ function dollyScale(k: number) {
   controls.update()
 }
 
-// Visibility mask: null => all visible; list => only those indices visible
 function applyVisibilityMask(indices: number[] | null) {
   const keep = indices ? new Set(indices) : null
   parts.forEach((p, i) => {
@@ -377,14 +436,22 @@ function applyVisibilityMask(indices: number[] | null) {
 
 // ---------- Public init
 export async function initViewer(container: HTMLElement, opts: InitOptions = {}): Promise<ViewerHandle> {
+  initOpts = { lightRig: 'mobile', envIntensity: 1.15, backdropColor: 0xbababa, useACES: true, ...opts }
   mountEl = container
 
   // Renderer
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
   const dprCap = /iPad|iPhone|iPod/.test(navigator.userAgent) ? 1.5 : 2
+  renderer.outputColorSpace = THREE.SRGBColorSpace as any
+  renderer.toneMapping = (initOpts.useACES ?? true) ? THREE.ACESFilmicToneMapping : THREE.NoToneMapping
+  renderer.toneMappingExposure = initOpts.toneMappingExposure ?? 1.15
+  renderer.shadowMap.enabled = !!initOpts.enableShadows
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap
+  renderer.xr.enabled = true
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, dprCap))
+  renderer.setClearColor(0xffffff, 1)
 
-  // Canvas element must obey container bounds exactly
+  // Canvas sizing
   container.appendChild(renderer.domElement)
   const cvs = renderer.domElement as HTMLCanvasElement
   cvs.style.position = 'absolute'
@@ -415,14 +482,6 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
     window.visualViewport.addEventListener('scroll', sizeToContainer)
   }
 
-  renderer.setClearColor(0xffffff, 1)
-  renderer.outputColorSpace = THREE.SRGBColorSpace
-  renderer.toneMapping = THREE.ACESFilmicToneMapping
-  renderer.toneMappingExposure = opts.toneMappingExposure ?? 1.0
-  renderer.shadowMap.enabled = !!opts.enableShadows
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap
-  renderer.xr.enabled = true
-
   // Scene + Camera
   scene = new THREE.Scene()
   scene.background = new THREE.Color(0xffffff)
@@ -431,8 +490,8 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
   scene.add(camera)
 
   // Environment
-  if (opts.hdriUrl) {
-    try { await loadHDRIToEnv(opts.hdriUrl, !!opts.showHDRIBackground) }
+  if (initOpts.hdriUrl) {
+    try { await loadHDRIToEnv(initOpts.hdriUrl, !!initOpts.showHDRIBackground) }
     catch (e) { console.warn('HDRI load failed, using RoomEnvironment', e) }
   }
   if (!scene.environment) {
@@ -440,18 +499,18 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
     const env = new RoomEnvironment()
     const envTex = pmrem.fromScene(env, 0.04).texture
     scene.environment = envTex
-    if (opts.showHDRIBackground) scene.background = envTex
+    if (initOpts.showHDRIBackground) scene.background = envTex
   }
 
-  // Backdrop + shadow ground
+  // Backdrop + light rig (match mobile)
   addStudioBackdrop()
+  if ((initOpts.lightRig ?? 'mobile') !== 'none') addMobileLightRig()
 
   // PostFX (single pipeline)
   composer = new EffectComposer(renderer)
   renderPass = new RenderPass(scene, camera)
   composer.addPass(renderPass)
 
-  // Optional global blur (off by default)
   hBlurPass = new ShaderPass(HorizontalBlurShader)
   vBlurPass = new ShaderPass(VerticalBlurShader)
   hBlurPass.enabled = false
@@ -461,11 +520,11 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
 
   bloomPass = new UnrealBloomPass(
     new THREE.Vector2(1, 1),
-    opts.bloomStrength ?? 0.18,
-    opts.bloomRadius ?? 0.22,
-    opts.bloomThreshold ?? 0.8
+    initOpts.bloomStrength ?? 0.1,
+    initOpts.bloomRadius ?? 0.22,
+    initOpts.bloomThreshold ?? 0.8
   )
-  bloomPass.enabled = opts.bloomEnabled ?? true
+  bloomPass.enabled = initOpts.bloomEnabled ?? true
   composer.addPass(bloomPass)
 
   outputPass = new OutputPass()
@@ -491,14 +550,11 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
   const clock = new THREE.Clock()
   const renderFrame = () => {
     const dt = clock.getDelta()
-
-    // smooth target (OrbitControls.target -> desired)
     if (controls) {
       const lerpAmt = 1 - Math.pow(1 - TARGET_LERP, dt * 60)
       controls.target.lerp(target_desired, lerpAmt)
       controls.update()
     }
-
     if (mixer) mixer.update(dt * playbackSpeed)
 
     if (renderer?.xr?.isPresenting) {
@@ -511,28 +567,23 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
   }
   renderer.setAnimationLoop(renderFrame)
 
-  // Load initial model (uses Vite BASE_URL-safe path)
-  await loadGLB(opts.modelUrl ?? DEFAULT_MODEL_URL)
+  // Load initial model
+  await loadGLB(initOpts.modelUrl ?? DEFAULT_MODEL_URL)
 
-  // Ensure initial desired target = current center
+  // Initial target = current center
   target_desired.copy(centroid)
 
   return {
-    setOrbitTargetByName: (name: string | null, _zoomScale = 1.0) => {
+    setOrbitTargetByName: (name: string | null) => {
       if (!controls) return false
-      if (!name) {
-        target_desired.copy(centroid)
-        return true
-      }
+      if (!name) { target_desired.copy(centroid); return true }
       const pos = getWorldPosByName(name)
       if (!pos) return false
       target_desired.copy(pos)
       return true
     },
 
-    setVisibleIndices: (indices: number[] | null) => {
-      applyVisibilityMask(indices)
-    },
+    setVisibleIndices: (indices: number[] | null) => applyVisibilityMask(indices),
 
     setBlur: (amountPx: number) => {
       blurAmountPx = Math.max(0, amountPx | 0)
@@ -553,6 +604,19 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
 
     loadGLB,
     dispose: () => {
+      if (studioBackdropWire) {
+        ;(studioBackdropWire.geometry as any)?.dispose?.()
+        ;(studioBackdropWire.material as any)?.dispose?.()
+        scene?.remove(studioBackdropWire)
+        studioBackdropWire = null
+      }
+      if (studioBackdropWireHalo) {
+        ;(studioBackdropWireHalo.geometry as any)?.dispose?.()
+        ;(studioBackdropWireHalo.material as any)?.dispose?.()
+        scene?.remove(studioBackdropWireHalo)
+        studioBackdropWireHalo = null
+      }
+      
       if (_zoomAnimRAF !== null) { cancelAnimationFrame(_zoomAnimRAF); _zoomAnimRAF = null }
       _explodedZoomApplied = false
 
@@ -648,8 +712,6 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
     },
 
     // Explosion controller (state-aware)
-    // t=0 => overview (first frame, clamped)
-    // t=1 => exploded (last frame, clamped)
     setExplode: (t: number) => {
       if (!mixer || !Object.keys(actions).length) return
       t = THREE.MathUtils.clamp(t, 0, 1)
@@ -765,7 +827,6 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
     resumeAnimation: () => { if (activeAction) activeAction.paused = false },
     setAnimationSpeed: (speed: number) => {
       playbackSpeed = Math.max(0, speed)
-      // actions use timeScale ±1; overall speed comes from mixer.update(dt * playbackSpeed)
       Object.values(actions).forEach(a => a.setEffectiveTimeScale(Math.sign(a.getEffectiveTimeScale()) || 1))
     },
 
@@ -784,7 +845,6 @@ export function disposeViewer(h: ViewerHandle) { h.dispose() }
 async function loadGLB(fileOrUrl: File | string) {
   if (!scene) return
 
-  // stop any running zoom animation and reset flag
   if (_zoomAnimRAF !== null) { cancelAnimationFrame(_zoomAnimRAF); _zoomAnimRAF = null }
   _explodedZoomApplied = false
 
@@ -808,7 +868,7 @@ async function loadGLB(fileOrUrl: File | string) {
   const loader = new GLTFLoader()
   try {
     const draco = new DRACOLoader()
-    draco.setDecoderPath(DRACO_PATH) // /draco/
+    draco.setDecoderPath(DRACO_PATH)
     loader.setDRACOLoader(draco)
   } catch {
     console.warn('DRACOLoader not available; ensure /public/draco decoders if needed.')
@@ -821,56 +881,51 @@ async function loadGLB(fileOrUrl: File | string) {
       url,
       (gltf: any) => {
         const root = gltf.scene || (gltf.scenes && gltf.scenes[0])
-        if (!root) {
-          console.error('GLTF has no scene.')
-          reject(new Error('GLTF has no scene'))
-          return
-        }
+        if (!root) { reject(new Error('GLTF has no scene')); return }
         currentModel = root
 
-        // Mesh setup
+        // Mesh setup (shadows follow initOpts)
         root.traverse((obj: any) => {
           if (obj.isMesh) {
-            obj.castShadow = true
-            obj.receiveShadow = true
+            const useShadows = !!initOpts.enableShadows
+            obj.castShadow = useShadows
+            obj.receiveShadow = useShadows
           }
         })
 
-        // Clone materials once (records baseline opacity)
+        // Materials/lights normalization
         cloneMaterials(root)
         normalizeImportedLights(root)
+
+        // Mobile-like reflection lift
+        setEnvIntensity(root, initOpts.envIntensity ?? 1.15)
 
         // Parts for isolate/focus
         parts = gatherParts(root)
         partNames = parts.map((p, i) => p.name || `Part ${i + 1}`)
 
-        // Stats
+        // Stats, add, and frame
         computeModelStats(root)
-
-        // Scene add
         scene!.add(root)
-
-        // One-time fit to view
         fitCameraToObject(root, 1.25)
 
-        // Animations (GLB-driven explosion)
+        // Animations (GLB-driven)
         if (gltf.animations && gltf.animations.length) {
           mixer = new THREE.AnimationMixer(root)
           gltf.animations.forEach((clip: THREE.AnimationClip, i: number) => {
             const name = clip.name?.length ? clip.name : `Clip_${i}`
             const action = mixer!.clipAction(clip)
             action.enabled = true
-            action.setLoop(THREE.LoopOnce, 0)  // one-shot
+            action.setLoop(THREE.LoopOnce, 0)
             action.clampWhenFinished = true
-            action.reset()                      // at t=0 pose
-            action.paused = true                // wait for setExplode(1)
+            action.reset()
+            action.paused = true
             action.setEffectiveWeight(1)
             action.setEffectiveTimeScale(1)
             actions[name] = action
             clipNames.push(name)
             clipDurations[name] = clip.duration
           })
-          // Ensure initial rest pose is visible and state = overview
           mixer.update(1e-6)
           explodeState = 0
         } else {
@@ -881,10 +936,7 @@ async function loadGLB(fileOrUrl: File | string) {
         resolve()
       },
       undefined,
-      (err) => {
-        console.error('[GLTFLoader] failed', err)
-        reject(err)
-      }
+      (err) => { console.error('[GLTFLoader] failed', err); reject(err) }
     )
   })
 }

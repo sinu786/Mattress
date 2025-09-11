@@ -27,8 +27,13 @@ const DRACO_PATH = `${BASE}draco/`
 // Tweakables for initial zoom
 const INITIAL_FRAME_PADDING = 2.5   // larger = farther, smaller = closer
 const INITIAL_ZOOM_FACTOR   = 5   // optional post-fit nudge (<1 in, >1 out), 1=disabled
-
 export type InitOptions = {
+  // Lighting (match mobile)
+  lightRig?: 'mobile' | 'none'      // default: 'mobile'
+  envIntensity?: number             // default: 1.15 (PBR reflections)
+  backdropColor?: number | string   // default: 0xf5f7fb
+  useACES?: boolean                 // default: true
+
   scrollScrub?: boolean
   modelUrl?: string
   hdriUrl?: string
@@ -40,6 +45,7 @@ export type InitOptions = {
   bloomStrength?: number
   bloomRadius?: number
 }
+
 
 export type ViewerHandle = {
   setOrbitTargetByName: (name: string | null, zoomScale?: number) => boolean
@@ -79,6 +85,8 @@ export type ViewerHandle = {
 }
 
 // ---------- Scene locals
+
+let initOpts: InitOptions = {}
 let renderer: THREE.WebGLRenderer | null = null
 let scene: THREE.Scene | null = null
 let camera: THREE.PerspectiveCamera | null = null
@@ -119,6 +127,9 @@ let reticle: THREE.Mesh | null = null
 
 // Studio backdrop
 let studioBackdrop: THREE.Mesh | null = null
+let studioBackdropWire: THREE.LineSegments | null = null   // NEW
+let studioBackdropWireHalo: THREE.LineSegments | null = null // NEW
+
 
 // Animations
 let mixer: THREE.AnimationMixer | null = null
@@ -177,7 +188,48 @@ function clearExplodedZoom() {
   _explodedZoomApplied = false
 }
 
+
 // ---------- helpers
+
+function setEnvIntensity(root: THREE.Object3D, intensity: number) {
+  root.traverse((o: any) => {
+    if (!o.isMesh) return
+    const apply = (m: THREE.Material) => {
+      const std = m as any
+      if ('envMapIntensity' in std) std.envMapIntensity = intensity
+    }
+    if (Array.isArray(o.material)) o.material.forEach(apply)
+    else if (o.material) apply(o.material)
+  })
+}
+
+
+function addMobileLightRig() {
+  if (!scene) return
+
+  // Soft ambient (sky/ground), cheap and stable
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.55)
+  hemi.position.set(0, 1, 0)
+  scene.add(hemi)
+
+  // Key (main directional), no shadows to avoid mobile perf hits/banding
+  const key = new THREE.DirectionalLight(0xffffff, 1.35)
+  key.position.set(3.0, 3.2, 2.0)
+  key.castShadow = false
+  scene.add(key)
+
+  // Rim / kicker from behind
+  const rim = new THREE.DirectionalLight(0xffffff, 0.8)
+  rim.position.set(-2.2, 2.6, -3.2)
+  rim.castShadow = false
+  scene.add(rim)
+
+  // Gentle fill near camera (keeps faces from going black at glancing angles)
+  const fill = new THREE.PointLight(0xffffff, 0.55, 0, 2)
+  fill.position.set(0, 1.1, 2.8)
+  scene.add(fill)
+}
+
 function createReticle() {
   const ringGeo = new THREE.RingGeometry(0.09, 0.1, 32).rotateX(-Math.PI / 2)
   const mat = new THREE.MeshBasicMaterial({ color: 0x66bbff })
@@ -206,16 +258,53 @@ async function loadHDRIToEnv(url: string, showBackground: boolean) {
 }
 function addStudioBackdrop() {
   if (!scene) return
+  const col = (initOpts.backdropColor ?? 0xf5f7fb) as any
+
+  // Base sphere (inside-out “infinite” studio)
   const geo = new THREE.SphereGeometry(50, 64, 64)
   const mat = new THREE.MeshStandardMaterial({
-    color: 0xababab, roughness: 1.0, metalness: 0.0, side: THREE.BackSide
+    color: col,
+    roughness: 0.98,
+    metalness: 0.0,
+    side: THREE.BackSide
   })
   const mesh = new THREE.Mesh(geo, mat)
+  // Don’t write depth so overlay lines don’t z-fight and stay visible
+  ;(mesh.material as THREE.MeshStandardMaterial).depthWrite = false
   mesh.receiveShadow = false
   mesh.castShadow = false
   scene.add(mesh)
   studioBackdrop = mesh
+
+  // Wireframe overlay (thin gridlines)
+  const wireGeo = new THREE.WireframeGeometry(geo)
+  const wireMat = new THREE.LineBasicMaterial({
+    color: 0xffffff,      // soft desaturated blue/steel
+    transparent: true,
+    opacity: 1,
+    depthTest: false      // draw over the backdrop regardless of depth
+  })
+  const wire = new THREE.LineSegments(wireGeo, wireMat)
+  wire.renderOrder = -1   // behind scene content, ahead of clear color
+  scene.add(wire)
+  studioBackdropWire = wire
+
+  // “Halo” outline: same wire slightly scaled, lighter & softer
+  const haloGeo = wireGeo   // reuse geometry safely (immutable here)
+  const haloMat = new THREE.LineBasicMaterial({
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.18,
+    depthTest: false
+  })
+  const halo = new THREE.LineSegments(haloGeo, haloMat)
+  halo.scale.setScalar(1.002) // tiny expansion = soft outer rim
+  halo.renderOrder = -0.99
+  scene.add(halo)
+  studioBackdropWireHalo = halo
 }
+
+
 function normalizeImportedLights(root: THREE.Object3D) {
   root.traverse(obj => {
     const l: any = obj
@@ -229,6 +318,8 @@ function normalizeImportedLights(root: THREE.Object3D) {
     if (l.decay !== undefined) l.decay = 2
   })
 }
+
+
 function computeModelStats(obj: THREE.Object3D) {
   bbox.setFromObject(obj)
   bbox.getCenter(centroid)
@@ -356,6 +447,9 @@ function centerRootUnderPivot(root: THREE.Object3D) {
 
 // ---------- Public init
 export async function initViewer(container: HTMLElement, opts: InitOptions = {}): Promise<ViewerHandle> {
+
+  initOpts = { lightRig: 'mobile', envIntensity: 1.15, backdropColor: 0xbababa, useACES: true, ...opts }
+
   mountEl = container
 
   // Renderer (mobile-lean)
@@ -367,6 +461,14 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
     depth: true,
     preserveDrawingBuffer: false,
   })
+
+    // Color management & tonemapping (mobile-friendly studio look)
+    renderer.outputColorSpace = THREE.SRGBColorSpace as any
+    renderer.toneMapping = (opts.useACES ?? true)
+      ? THREE.ACESFilmicToneMapping
+      : THREE.NoToneMapping
+    renderer.toneMappingExposure = opts.toneMappingExposure ?? 1.15
+  
   const dprCap = 1.25
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap))
   // Canvas element must obey container bounds exactly
@@ -425,6 +527,9 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
   // Backdrop
   addStudioBackdrop()
 
+  if ((initOpts.lightRig ?? 'mobile') !== 'none') addMobileLightRig()
+
+
   // PostFX
   composer = new EffectComposer(renderer)
   renderPass = new RenderPass(scene, camera)
@@ -438,9 +543,9 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
   composer.addPass(vBlurPass)
 
   bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1),
-    opts.bloomStrength ?? 0.12,
-    opts.bloomRadius ?? 0.18,
-    opts.bloomThreshold ?? 0.85
+  opts.bloomStrength ?? 0.1,
+  opts.bloomRadius ?? 0.22,
+  opts.bloomThreshold ?? 0.8
   )
   bloomPass.enabled = opts.bloomEnabled ?? true
   composer.addPass(bloomPass)
@@ -523,6 +628,19 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
 
     loadGLB,
     dispose: () => {
+      if (studioBackdropWire) {
+        ;(studioBackdropWire.geometry as any)?.dispose?.()
+        ;(studioBackdropWire.material as any)?.dispose?.()
+        scene?.remove(studioBackdropWire)
+        studioBackdropWire = null
+      }
+      if (studioBackdropWireHalo) {
+        ;(studioBackdropWireHalo.geometry as any)?.dispose?.()
+        ;(studioBackdropWireHalo.material as any)?.dispose?.()
+        scene?.remove(studioBackdropWireHalo)
+        studioBackdropWireHalo = null
+      }
+      
       if (_zoomAnimRAF !== null) { cancelAnimationFrame(_zoomAnimRAF); _zoomAnimRAF = null }
       _explodedZoomApplied = false
 
@@ -809,13 +927,19 @@ async function loadGLB(fileOrUrl: File | string) {
         // Mesh setup
         root.traverse((obj: any) => {
           if (obj.isMesh) {
-            obj.castShadow = true
-            obj.receiveShadow = true
+            // Mobile: avoid real-time shadows (banding + perf), lean on env + rig
+            obj.castShadow = false
+            obj.receiveShadow = false
           }
+
         })
 
         cloneMaterials(root)
         normalizeImportedLights(root)
+
+        // Subtle reflection boost for a clean studio look
+        setEnvIntensity(root, initOpts.envIntensity ?? 1.15)
+
 
         // Center under pivot and add to scene
         centerRootUnderPivot(root)

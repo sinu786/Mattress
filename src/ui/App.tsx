@@ -32,14 +32,20 @@ export default function App() {
   // headline animation key
   const [headlineKey, setHeadlineKey] = useState(0)
 
+  // NEW: mobile-only AR helpers
+  const [isMobile, setIsMobile] = useState(false)
+  const quickLookRef = useRef<HTMLAnchorElement>(null)
+
   // ---------- init viewer
   useEffect(() => {
     if (!mountRef.current) return
     let cleanup = () => {}
 
     ;(async () => {
-      const isMobile = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (window.innerWidth < 820)
-      const viewerModule = isMobile ? await import('../viewer.mobile') : await import('../viewer')
+      const isMobileUA = /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (window.innerWidth < 820)
+      setIsMobile(isMobileUA)
+
+      const viewerModule = isMobileUA ? await import('../viewer.mobile') : await import('../viewer')
       const initViewer = viewerModule.initViewer as (el: HTMLElement, opts?: InitOptions) => Promise<ViewerHandle>
       const disposeViewer = viewerModule.disposeViewer as (h: ViewerHandle) => void
 
@@ -297,7 +303,7 @@ export default function App() {
     (/iPad|iPhone|iPod/.test(navigator.userAgent) ||
      (navigator.platform === 'MacIntel' && (navigator as any).maxTouchPoints > 1))
 
-  // Android / Others: WebXR AR
+  // Android/iOS: WebXR-first; fallback to Quick Look on iOS
   const onClickViewInAR = async () => {
     try {
       const xr = (navigator as any).xr
@@ -308,8 +314,16 @@ export default function App() {
           return
         }
       }
-    } catch {}
-    alert('AR not supported on this device.')
+    } catch {
+      // ignore and try fallback
+    }
+
+    if (isiOS && quickLookRef.current) {
+      quickLookRef.current.click()
+      return
+    }
+
+    alert('AR not supported on this device/browser.')
   }
 
   const total = Math.max(1, 2 + namedParts.length)
@@ -391,6 +405,7 @@ export default function App() {
 
   /* ===== Stage rail on the right ===== */
   .stage-rail {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
     position: absolute;
     right: 16px;
     top: 50%;
@@ -609,29 +624,28 @@ export default function App() {
               <ResetIcon /><span className="dock-label">Reset</span>
             </button>
 
-            {/* AR control */}
-            {isiOS ? (
-              <a
-                className="dock-btn ar-primary"
-                rel="ar"
-                href={usdzHref || '/assets/bed.usdz'}  // use chosen USDZ if present
-                aria-label="View in your room"
-                style={{ position: 'relative', textDecoration: 'none' }}
-              >
-                {/* Invisible poster image required by Quick Look */}
-                <img
-                  src="/assets/poster.jpg"
-                  alt=""
-                  width={100}
-                  height={100}
-                  style={{ position: 'absolute', opacity: 0, width: 1, height: 1, pointerEvents: 'none' }}
-                />
-                <ArIcon /><span className="dock-label">View in AR</span>
-              </a>
-            ) : (
-              <button className="dock-btn ar-primary" onClick={onClickViewInAR} aria-label="View in your room">
-                <ArIcon /><span className="dock-label">View in AR</span>
-              </button>
+            {/* AR control — MOBILE ONLY. WebXR first; iOS Quick Look fallback */}
+            {isMobile && (
+              <>
+                <button
+                  className="dock-btn ar-primary"
+                  onClick={onClickViewInAR}
+                  aria-label="View in your room"
+                >
+                  <ArIcon /><span className="dock-label">View in AR</span>
+                </button>
+
+                {/* Hidden iOS Quick Look fallback target (must be in DOM, not display:none) */}
+                <a
+                  ref={quickLookRef}
+                  rel="ar"
+                  href={usdzHref || '/assets/bed.usdz'}
+                  style={{ position: 'absolute', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+                  aria-hidden="true"
+                >
+                  <img src="/assets/poster.jpg" alt="" width={1} height={1} />
+                </a>
+              </>
             )}
           </div>
 
