@@ -1,10 +1,11 @@
-// src/viewer.mobile.ts
-// Mobile build with feature parity to desktop viewer, plus performance optimizations.
-// - Force-centers any GLB by wrapping in a pivot at the origin (consistent framing on phones).
-// - Touch rotate works (explicit touchAction + touches mapping).
-// - Section names: promote inner "sec N" node names to their parent parts so App.tsx can detect sections.
-// - Canvas strictly follows the mount's visible bounds (ResizeObserver + visualViewport).
-
+// src/viewer.mobile.ts — soft soft-shadow mobile build (VSM + shadow catcher)
+// - Force-centers any GLB by wrapping in a pivot at the origin
+// - Touch rotate works (explicit touchAction + touches mapping)
+// - Section names: promote inner "sec N" node names to their parent parts so App.tsx can detect sections
+// - Canvas strictly follows the mount's visible bounds (ResizeObserver + visualViewport)
+// - High-quality soft shadows (VSM when WebGL2 available, fallback PCFSoft)
+// - Mirror removed (mobile lean); translucent ShadowMaterial catcher + overlays provide contact shadows
+// - Radial reveal (ring) that fades materials in by alpha, with ripple
 
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
@@ -20,43 +21,116 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js'
 import { HorizontalBlurShader } from 'three/examples/jsm/shaders/HorizontalBlurShader.js'
 import { VerticalBlurShader } from 'three/examples/jsm/shaders/VerticalBlurShader.js'
-import { Reflector } from 'three/examples/jsm/objects/Reflector.js'
 
+// ---- Bullet-proof program cache key guard (place BEFORE creating any materials) ----
+(() => {
+  const FLAG = Symbol('safeCacheKeyPatched');
+
+  const safeStr = (v: any) => {
+    try { return typeof v === 'function' ? String(v) : ''; }
+    catch { return ''; }
+  };
+
+  const decorate = (proto: any) => {
+    if (!proto || proto[FLAG]) return;
+    const orig = typeof proto.customProgramCacheKey === 'function'
+      ? proto.customProgramCacheKey
+      : null;
+
+    proto.customProgramCacheKey = function customProgramCacheKeySafe() {
+      let base = '';
+      try {
+        base = orig ? String(orig.call(this) ?? '') : '';
+      } catch { /* ignore */ }
+
+      const obc = safeStr(this && this.onBeforeCompile);
+      const flags = [];
+      if (this?.userData?.__revealPatched) flags.push('reveal');
+      if (this?.depthWrite === false)      flags.push('dw0');
+      if (this?.userData?.__sssPatched) flags.push('sss'); // <-- add this
+
+
+      return `${base}|${obc}|${flags.join(',')}`;
+    };
+
+    proto[FLAG] = true;
+  };
+
+  // Patch Material + the common PBR subclasses that have their own cache keys
+  decorate((THREE as any).Material?.prototype);
+  decorate((THREE as any).MeshStandardMaterial?.prototype);
+  decorate((THREE as any).MeshPhysicalMaterial?.prototype);
+  decorate((THREE as any).ShaderMaterial?.prototype);
+})();
+
+// ===== Radial Reveal (wave) =====
+const REVEAL_DURATION_MS = 1000;   // total time for ring to reach model bounds
+const REVEAL_SOFTNESS    = 0.24;   // width of the fade edge (as a fraction of model radius)
+const REVEAL_RIPPLE_AMP  = 0.06;   // 0..~0.15 looks nice
+const REVEAL_RIPPLE_FREQ = 6.0;    // rings per unit distance
+const REVEAL_SPEED       = 1.0;    // multiplier
+let keyLight: THREE.DirectionalLight | null = null
+
+// SSS plumbing
+type SSSOpts = { color?: number|string; strength?: number; wrap?: number; power?: number; thickness?: number }
+const _sssUniformPools: any[] = []   // collect all SSS uniform sets to update per frame
+let _sssEnabled = false
+const _tmpLPos = new THREE.Vector3()
+const _tmpLTgt = new THREE.Vector3()
+const _tmpLDir = new THREE.Vector3()
+
+let revealActive = false
+let revealStartT = 0
+let revealMaxR   = 1
+let revealCenterW = new THREE.Vector3()  // world-space center (we use pivot center)
+const _tmpVec3A = new THREE.Vector3()
+const _tmpVec3B = new THREE.Vector3()
 
 const BASE = (import.meta as any).env?.BASE_URL ?? '/'
 const DEFAULT_MODEL_URL = `${BASE}assets/bed.glb`
 const DRACO_PATH = `${BASE}draco/`
-// ---- Ground style knobs
-const GROUND_TINT        = 0xFFFFFF; // mirror tint (darker = moodier)
-const GROUND_SHEEN_COLOR = 0xFFFFFF; // film layer color
-const GROUND_SHEEN_OPAC  = 0.07;     // film layer opacity
-const GROUND_FADE_COLOR  = 0xFFFFFF; // radial fade color
-const GROUND_FADE_OPAC   = 0.22;     // radial fade strength
 
-
+// Soft shadow knobs
+const SHADOW_MAP_SIZE  = 4096// 1024–2048 is a good range for mobile
+const SHADOW_RADIUS    = 100   // VSM blur radius or PCFSoft softness hint
+// Contact shadow shaping (tweak to taste)
+const SHADOW_BASE_OPACITY   = .9  // actual received shadow
+const SHADOW_CORE_OPACITY   = 1000 // extra darkening in the center
+const SHADOW_CORE_SCALE     = 0 // 0..1 of disc for the core
+const SHADOW_FEATHER_OPAC   = 0 // very soft outer penumbra
+const SHADOW_FEATHER_INNER  = 0 // where feather starts (0..1 radius)
+const SHADOW_FEATHER_OUTER  = 0 // where feather ends
 
 // Tweakables for initial zoom
-const INITIAL_FRAME_PADDING = 2.5   // larger = farther, smaller = closer
-const INITIAL_ZOOM_FACTOR   = 5   // optional post-fit nudge (<1 in, >1 out), 1=disabled
+const INITIAL_FRAME_PADDING = 1.3
+const INITIAL_ZOOM_FACTOR   =1.5
+
 export type InitOptions = {
-  // Lighting (match mobile)
-  lightRig?: 'mobile' | 'none'      // default: 'mobile'
-  envIntensity?: number             // default: 1.15 (PBR reflections)
-  backdropColor?: number | string   // default: 0xf5f7fb
-  useACES?: boolean                 // default: true
+  // Ground visuals
+  groundStyle?: 'full' | 'invisible'   // default: 'invisible'
+  reflectOpacity?: number              // 0..1, default: 0.14 (reflection only, no base)
+
+  // Lighting
+  lightRig?: 'mobile' | 'none' // default: 'mobile'
+  envIntensity?: number        // default: 1.15 (PBR reflections)
+  backdropColor?: number | string // default: 0xf5f7fb
+  useACES?: boolean            // default: true
+
+  // New shadow controls
+  enableShadows?: boolean      // default: true on capable devices
+  shadowOpacity?: number       // default: 0.35
+  shadowMapSize?: number       // default: 1536
 
   scrollScrub?: boolean
   modelUrl?: string
   hdriUrl?: string
   showHDRIBackground?: boolean
-  enableShadows?: boolean
   toneMappingExposure?: number
   bloomEnabled?: boolean
   bloomThreshold?: number
   bloomStrength?: number
   bloomRadius?: number
 }
-
 
 export type ViewerHandle = {
   setOrbitTargetByName: (name: string | null, zoomScale?: number) => boolean
@@ -95,8 +169,9 @@ export type ViewerHandle = {
   setBloom: (opts: { enabled?: boolean; threshold?: number; strength?: number; radius?: number }) => void
 }
 
-// ---------- Scene locals
 
+
+// ---------- Scene locals
 let initOpts: InitOptions = {}
 let renderer: THREE.WebGLRenderer | null = null
 let scene: THREE.Scene | null = null
@@ -104,7 +179,9 @@ let camera: THREE.PerspectiveCamera | null = null
 let controls: any = null
 let groundGroup: THREE.Group | null = null
 let groundMirror: any = null
+let groundFilm: THREE.Mesh | null = null
 let groundFade: THREE.Mesh | null = null
+let shadowCatcher: THREE.Mesh | null = null
 
 let composer: any = null
 let renderPass: any = null
@@ -113,9 +190,8 @@ let outputPass: any = null
 let hBlurPass: any = null
 let vBlurPass: any = null
 let blurAmountPx = 0
-let groundFilm: THREE.Mesh | null = null
 let modelSpinEnabled = false
-let modelSpinSpeed = 0.2 // radians per second (≈11.5°/s) – tweak to taste
+let modelSpinSpeed = 0.2 // radians per second
 
 let pmrem: THREE.PMREMGenerator | null = null
 let autoRotateEnabled = true
@@ -123,7 +199,6 @@ let mountEl: HTMLElement | null = null
 
 // Pivot that holds the current GLB (centered at origin)
 let pivot: THREE.Group | null = null
-
 // "currentModel" points to the pivot (so AR placement moves the whole)
 let currentModel: THREE.Object3D | null = null
 
@@ -145,7 +220,6 @@ let reticle: THREE.Mesh | null = null
 // Studio backdrop
 let studioBackdrop: THREE.Mesh | null = null
 
-
 // Animations
 let mixer: THREE.AnimationMixer | null = null
 let actions: Record<string, THREE.AnimationAction> = {}
@@ -156,11 +230,12 @@ let playbackSpeed = 1.0
 let explodeState: 0 | 1 = 0
 
 // ===== Smooth zoom for exploded view =====
-const EXPLODED_ZOOM_FACTOR = 1.25
+const EXPLODED_ZOOM_FACTOR = 2
 const EXPLODED_ZOOM_MS = 380
 let _explodedZoomApplied = false
 let _zoomAnimRAF: number | null = null
 const _easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3)
+
 function _currentDist(): number {
   if (!camera || !controls) return 0
   return new THREE.Vector3().subVectors(camera.position, controls.target).length()
@@ -203,21 +278,103 @@ function clearExplodedZoom() {
   _explodedZoomApplied = false
 }
 
-
 // ---------- helpers
+
+function _applyRevealToRoot(root: THREE.Object3D, softDist: number) {
+  root.traverse((o: any) => {
+    if (!o.isMesh || !o.material) return
+    const patch = (mat: any) => {
+      _injectRevealShader(mat)
+      const u = mat.userData?.__revealUniforms
+      if (u) { u.uSoft.value = softDist }
+      mat.needsUpdate = true
+    }
+    if (Array.isArray(o.material)) o.material.forEach(patch)
+    else patch(o.material)
+  })
+}
+
+function _updateReveal(root: THREE.Object3D, tNow: number) {
+  // returns false when finished
+  const t = Math.min(1, (tNow - revealStartT) / Math.max(1, REVEAL_DURATION_MS))
+  const r = revealMaxR * (t * REVEAL_SPEED)
+  const timePhase = t * Math.PI * 2.0
+
+  let anyMat = false
+  root.traverse((o:any)=>{
+    if (!o.isMesh || !o.material) return
+    const upd = (mat:any) => {
+      const u = mat.userData?.__revealUniforms
+      if (!u) return
+      anyMat = true
+      u.uCenter.value.copy(revealCenterW)
+      u.uR.value = r
+      u.uTime.value = timePhase
+    }
+    if (Array.isArray(o.material)) o.material.forEach(upd)
+    else upd(o.material)
+  })
+
+  // done?
+  return !(t >= 1 || !anyMat)
+}
+
+function _removeReveal(root: THREE.Object3D) {
+  root.traverse((o: any) => {
+    if (!o.isMesh || !o.material) return
+    const restore = (mat: any) => {
+      if (!mat.userData?.__revealPatched) return
+      const clean = mat.clone()
+      // remove dynamic hook
+      delete (clean as any).onBeforeCompile
+      if (clean.userData) {
+        delete clean.userData.__revealPatched
+        delete clean.userData.__revealUniforms
+        delete clean.userData.__revealDefaults
+      }
+      // restore depthWrite if it was originally true
+      const saved = savedMatProps.get(mat)
+      if (saved) {
+        (clean as any).transparent = saved.transparent
+        ;(clean as any).opacity = saved.opacity
+        ;(clean as any).depthWrite = true
+      }
+      o.material = clean
+      mat.dispose?.()
+    }
+    if (Array.isArray(o.material)) {
+      o.material = o.material.map((m: any) => {
+        const c = m.clone()
+        delete (c as any).onBeforeCompile
+        return c
+      })
+      o.material.forEach(restore)
+    } else {
+      restore(o.material)
+    }
+  })
+}
+
+function fitDirLightShadowToBBox(light: THREE.DirectionalLight, box: THREE.Box3) {
+  const s = Math.max(box.getSize(new THREE.Vector3()).x, box.getSize(new THREE.Vector3()).z) * 0.8
+  const cam = light.shadow.camera as THREE.OrthographicCamera
+  cam.left = -s; cam.right = s; cam.top = s; cam.bottom = -s
+  cam.near = 0.1; cam.far = Math.max(10, box.getSize(new THREE.Vector3()).y * 4)
+  cam.updateProjectionMatrix()
+  light.shadow.needsUpdate = true
+}
+
 function updateGroundHeightFromBBox() {
   if (!scene || !groundGroup) return
   const target = pivot || currentModel || scene
   const box = new THREE.Box3().setFromObject(target)
   if (!isFinite(box.min.y) || !isFinite(box.max.y)) return
   const newY = Math.min(box.min.y, groundBaseY) - GROUND_PAD
-
   if (groundMirror) (groundMirror as any).position.y = newY
+  if (shadowCatcher) shadowCatcher.position.y        = newY + 0.00012
   if (groundFilm)   groundFilm.position.y           = newY + 0.0002
   if (groundFade)   groundFade.position.y           = newY + 0.0003
 }
-
-
 
 function setEnvIntensity(root: THREE.Object3D, intensity: number) {
   root.traverse((o: any) => {
@@ -231,31 +388,80 @@ function setEnvIntensity(root: THREE.Object3D, intensity: number) {
   })
 }
 
+function polishPBRMaterials(root: THREE.Object3D) {
+  root.traverse((o: any) => {
+    if (!o.isMesh) return
+    const tune = (m: any) => {
+      if (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial) {
+        m.roughness = THREE.MathUtils.clamp(m.roughness ?? 0.6, 0.38, 0.85)
+        m.metalness = Math.min(m.metalness ?? 0.02, 0.35)
+        if ('sheen' in m) m.sheen = Math.min(m.sheen ?? 0.0, 0.15)
+        if ('clearcoat' in m) m.clearcoat = Math.min(m.clearcoat ?? 0.06, 0.09)
+        if ('clearcoatRoughness' in m) m.clearcoatRoughness = Math.max(m.clearcoatRoughness ?? 0.7, 0.65)
+        if ('envMapIntensity' in m) m.envMapIntensity = initOpts.envIntensity ?? 0.35
+      }
+    }
+    if (Array.isArray(o.material)) o.material.forEach(tune)
+    else if (o.material) tune(o.material)
+  })
+}
 
 function addMobileLightRig() {
+
+  
   if (!scene) return
+  const useShadows = !!(initOpts.enableShadows)
 
   // Soft ambient (sky/ground), cheap and stable
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.55)
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.1)
   hemi.position.set(0, 1, 0)
-  scene.add(hemi)
+  //scene.add(hemi)
 
-  // Key (main directional), no shadows to avoid mobile perf hits/banding
-  const key = new THREE.DirectionalLight(0xffffff, 1.35)
-  key.position.set(3.0, 3.2, 2.0)
-  key.castShadow = false
+  // Key (main directional)
+  const key = new THREE.DirectionalLight(0xffffff, 1)
+  key.position.set(2, 1.8, 2.8)
+  keyLight = key 
   scene.add(key)
 
+
+  if (useShadows) {
+  key.castShadow = true
+
+  // Bigger atlas = fewer jaggies before blur
+  const sms = initOpts.shadowMapSize ?? 4096
+  key.shadow.mapSize.set(sms, sms)
+
+  // Keep frustum tight (your fitDirLightShadowToBBox already helps)
+  key.shadow.camera.near = 0.1
+  key.shadow.camera.far = 25
+  key.shadow.camera.left = -8
+  key.shadow.camera.right = 8
+  key.shadow.camera.top = 8
+  key.shadow.camera.bottom = -8
+
+  key.shadow.normalBias = 0.02
+  key.shadow.bias = -0.0002
+
+  // SOFTNESS: VSM uses blurSamples; PCFSoft uses radius
+    ;(key.shadow as any).radius =25   // PCFSoft fallback
+}
+
+
+
   // Rim / kicker from behind
-  const rim = new THREE.DirectionalLight(0xffffff, 0.8)
-  rim.position.set(-2.2, 2.6, -3.2)
+  const rim = new THREE.DirectionalLight(0xffffff, 2)
+  rim.position.set(-2.2,1, -3.2)
   rim.castShadow = false
   scene.add(rim)
 
   // Gentle fill near camera (keeps faces from going black at glancing angles)
-  const fill = new THREE.PointLight(0xffffff, 0.55, 0, 2)
+  const fill = new THREE.DirectionalLight(0xffffff, 1)
   fill.position.set(0, 1.1, 2.8)
   scene.add(fill)
+
+  key.color.setRGB(1.0, 0.96, 0.90)   // warm key
+  rim.color.setRGB(0.85, 0.95, 1.0)   // cool rim
+  
 }
 
 function createReticle() {
@@ -273,6 +479,7 @@ function getWorldPosByName(name: string, out = new THREE.Vector3()): THREE.Vecto
   out.setFromMatrixPosition(obj.matrixWorld)
   return out
 }
+
 async function loadHDRIToEnv(url: string, showBackground: boolean) {
   if (!renderer || !scene) return
   pmrem = new THREE.PMREMGenerator(renderer)
@@ -288,24 +495,15 @@ function addStudioBackdrop() {
   if (!scene) return
   const col = (initOpts.backdropColor ?? 0xf5f7fb) as any
 
-  // Base sphere (inside-out “infinite” studio)
   const geo = new THREE.SphereGeometry(50, 64, 64)
-  const mat = new THREE.MeshStandardMaterial({
-    color: col,
-    roughness: 0.98,
-    metalness: 0.0,
-    side: THREE.BackSide
-  })
+  const mat = new THREE.MeshStandardMaterial({ color: col, roughness: 0.98, metalness: 0.0, side: THREE.BackSide })
   const mesh = new THREE.Mesh(geo, mat)
-  // Don’t write depth so overlay lines don’t z-fight and stay visible
   ;(mesh.material as THREE.MeshStandardMaterial).depthWrite = false
   mesh.receiveShadow = false
   mesh.castShadow = false
   scene.add(mesh)
   studioBackdrop = mesh
-
 }
-
 
 function normalizeImportedLights(root: THREE.Object3D) {
   root.traverse(obj => {
@@ -321,11 +519,7 @@ function normalizeImportedLights(root: THREE.Object3D) {
   })
 }
 
-
-function computeModelStats(obj: THREE.Object3D) {
-  bbox.setFromObject(obj)
-  bbox.getCenter(centroid)
-}
+function computeModelStats(obj: THREE.Object3D) { bbox.setFromObject(obj); bbox.getCenter(centroid) }
 function gatherParts(root: THREE.Object3D): THREE.Object3D[] {
   const set = new Set<THREE.Object3D>()
   root.children.forEach(ch => {
@@ -334,10 +528,7 @@ function gatherParts(root: THREE.Object3D): THREE.Object3D[] {
     if (hasMesh) set.add(ch)
   })
   if (set.size === 0) {
-    root.traverse(o => {
-      const m: any = o
-      if (m.isMesh && o.parent) set.add(o.parent)
-    })
+    root.traverse(o => { const m: any = o; if (m.isMesh && o.parent) set.add(o.parent) })
   }
   return Array.from(set)
 }
@@ -346,14 +537,9 @@ function promoteSectionNamesToParts(partsArr: THREE.Object3D[]) {
   const rx = /^(?:\s*(?:sec|se|section)\s*)(\d+)\s*$/i
   partsArr.forEach(p => {
     let chosen: string | null = null
-    if (typeof p.name === 'string' && rx.test(p.name.trim())) {
-      chosen = p.name
-    } else {
-      p.traverse(o => {
-        if (chosen) return
-        const n = (o.name || '').trim()
-        if (n && rx.test(n)) chosen = n
-      })
+    if (typeof p.name === 'string' && rx.test(p.name.trim())) { chosen = p.name }
+    else {
+      p.traverse(o => { if (chosen) return; const n = (o.name || '').trim(); if (n && rx.test(n)) chosen = n })
     }
     if (chosen) p.name = chosen
   })
@@ -423,65 +609,46 @@ function applyVisibilityMask(indices: number[] | null) {
     })
   })
 }
-
 // Center root under a pivot so model origin == model center
 function centerRootUnderPivot(root: THREE.Object3D) {
   if (!scene) return
-  if (!pivot) {
-    pivot = new THREE.Group()
-    pivot.name = 'Pivot'
-    scene.add(pivot)
-  } else {
-    while (pivot.children.length) pivot.remove(pivot.children[0])
-  }
+  if (!pivot) { pivot = new THREE.Group(); pivot.name = 'Pivot'; scene.add(pivot) }
+  else { while (pivot.children.length) pivot.remove(pivot.children[0]) }
 
   const box = new THREE.Box3().setFromObject(root)
-  const c = new THREE.Vector3()
-  box.getCenter(c)
-  root.position.sub(c)
-  root.updateMatrixWorld(true)
+  const c = new THREE.Vector3(); box.getCenter(c)
+  root.position.sub(c); root.updateMatrixWorld(true)
 
   pivot.add(root)
   currentModel = pivot
-
   centroid.set(0, 0, 0)
 }
 
 // ---------- Public init
 export async function initViewer(container: HTMLElement, opts: InitOptions = {}): Promise<ViewerHandle> {
-
-  initOpts = { lightRig: 'mobile', envIntensity: .5, backdropColor: 0xFFFFFF, useACES: true, ...opts }
-
+  initOpts = { lightRig: 'mobile', envIntensity: 0.02, backdropColor: 0xdbccaf, useACES: true, enableShadows: false, groundStyle: 'invisible', ...opts }
   mountEl = container
 
   // Renderer (mobile-lean)
-  renderer = new THREE.WebGLRenderer({
-    antialias : true,
-    alpha: false,
-    powerPreference: 'high-performance',
-    stencil: false,
-    depth: true,
-    preserveDrawingBuffer: false,
-  })
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance', stencil: false, depth: true, preserveDrawingBuffer: false })
 
-    // Color management & tonemapping (mobile-friendly studio look)
-    renderer.outputColorSpace = THREE.SRGBColorSpace as any
-    renderer.toneMapping = (opts.useACES ?? true)
-      ? THREE.ACESFilmicToneMapping
-      : THREE.NoToneMapping
-    renderer.toneMappingExposure = opts.toneMappingExposure ?? 1.15
-  
+  // Color management & tonemapping (mobile-friendly studio look)
+  renderer.outputColorSpace = THREE.SRGBColorSpace as any
+  renderer.toneMapping = (opts.useACES ?? true) ? THREE.ACESFilmicToneMapping : THREE.NoToneMapping
+  renderer.toneMappingExposure = (initOpts.toneMappingExposure ?? 1.05)
+
+  // Shadows
+  if (initOpts.enableShadows) {
+    renderer.shadowMap.enabled = true
+    renderer.shadowMap.type = (renderer.capabilities.isWebGL2 ? THREE.VSMShadowMap : THREE.PCFSoftShadowMap) as any
+  }
+
   const dprCap = 2
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap))
-  // Canvas element must obey container bounds exactly
   container.appendChild(renderer.domElement)
   const cvs = renderer.domElement as HTMLCanvasElement
-  cvs.style.position = 'absolute'
-  cvs.style.inset = '0'
-  cvs.style.width = '100%'
-  cvs.style.height = '100%'
-  cvs.style.display = 'block'
-  ;(cvs.style as any).touchAction = 'none' // important for OrbitControls
+  cvs.style.position = 'absolute'; cvs.style.inset = '0'; cvs.style.width = '100%'; cvs.style.height = '100%'; cvs.style.display = 'block'
+  ;(cvs.style as any).touchAction = 'none'
 
   // size to visible bounds
   const sizeToContainer = () => {
@@ -501,23 +668,20 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
   const ro = new ResizeObserver(sizeToContainer)
   ro.observe(container)
   window.addEventListener('orientationchange', sizeToContainer)
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener('resize', sizeToContainer)
-    window.visualViewport.addEventListener('scroll', sizeToContainer)
+  if ((window as any).visualViewport) {
+    ;(window as any).visualViewport.addEventListener('resize', sizeToContainer)
+    ;(window as any).visualViewport.addEventListener('scroll', sizeToContainer)
   }
 
   // Scene + Camera
   scene = new THREE.Scene()
   scene.background = new THREE.Color(0xffffff)
   camera = new THREE.PerspectiveCamera(50, 1, 0.01, 20000)
-  camera.position.set(0, 1, 3)
+  camera.position.set(1.5, 1, 3)
   scene.add(camera)
 
   // Environment
-  if (opts.hdriUrl) {
-    try { await loadHDRIToEnv(opts.hdriUrl, !!opts.showHDRIBackground) }
-    catch (e) { console.warn('HDRI load failed, using RoomEnvironment', e) }
-  }
+  if (opts.hdriUrl) { try { await loadHDRIToEnv(opts.hdriUrl, !!opts.showHDRIBackground) } catch (e) { console.warn('HDRI load failed, using RoomEnvironment', e) } }
   if (!scene.environment) {
     pmrem = new THREE.PMREMGenerator(renderer)
     const env = new RoomEnvironment()
@@ -531,7 +695,6 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
 
   if ((initOpts.lightRig ?? 'mobile') !== 'none') addMobileLightRig()
 
-
   // PostFX
   composer = new EffectComposer(renderer)
   renderPass = new RenderPass(scene, camera)
@@ -539,148 +702,123 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
 
   hBlurPass = new ShaderPass(HorizontalBlurShader)
   vBlurPass = new ShaderPass(VerticalBlurShader)
-  hBlurPass.enabled = false
-  vBlurPass.enabled = false
-  composer.addPass(hBlurPass)
-  composer.addPass(vBlurPass)
+  hBlurPass.enabled = false; vBlurPass.enabled = false
+  composer.addPass(hBlurPass); composer.addPass(vBlurPass)
 
   bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1),
-  opts.bloomStrength ?? 0.1,
-  opts.bloomRadius ?? 0.22,
-  opts.bloomThreshold ?? 0.8
+    initOpts.bloomStrength ?? .15,
+    initOpts.bloomRadius   ?? 1,
+    initOpts.bloomThreshold?? 0
   )
   bloomPass.enabled = opts.bloomEnabled ?? true
   composer.addPass(bloomPass)
 
-  outputPass = new OutputPass()
-  composer.addPass(outputPass)
+  outputPass = new OutputPass(); composer.addPass(outputPass)
   renderer.setClearColor(0x0b1220, 1)
-  scene.background = new THREE.Color(0x0b1220) // premium studio vibe
-  
+  scene.background = new THREE.Color(0x0b1220)
+
   // Reticle (AR)
-  reticle = createReticle()
-  scene.add(reticle)
+  reticle = createReticle(); scene.add(reticle)
 
   // Controls
   controls = new OrbitControls(camera, renderer.domElement)
-  controls.enableDamping = true
-  controls.dampingFactor = 0.06
-  controls.enablePan = false
-  controls.enableZoom = false
-  controls.enableRotate = true
-  controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN } // explicit
-  controls.autoRotate = autoRotateEnabled
-  controls.autoRotateSpeed = 0
-  controls.minDistance = 0.15
-  controls.maxDistance = 20000
-  controls.maxPolarAngle = Math.PI * 0.5
+  controls.enableDamping = true; controls.dampingFactor = 0.06
+  controls.enablePan = false; controls.enableZoom = false; controls.enableRotate = true
+  controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN }
+  controls.autoRotate = autoRotateEnabled; controls.autoRotateSpeed = 0
+  controls.minDistance = 0.15; controls.maxDistance = 20000; controls.maxPolarAngle = Math.PI * 0.5
 
   // Animate
   const clock = new THREE.Clock()
   const renderFrame = () => {
-    const dt = clock.getDelta()
-    if (controls) {
-      const lerpAmt = 1 - Math.pow(1 - TARGET_LERP, dt * 60)
-      controls.target.lerp(target_desired, lerpAmt)
-      controls.update()
-    }
-    if (mixer) mixer.update(dt * playbackSpeed)
 
-      if (modelSpinEnabled && pivot) {
-        pivot.rotation.y += modelSpinSpeed * dt
+    const renderFrame = () => {
+      // ---- radial reveal update
+      if (revealActive && pivot) {
+        const keepGoing = _updateReveal(pivot, performance.now())
+        if (!keepGoing) {
+          revealActive = false
+          _removeReveal(pivot)
+          if (controls) controls.autoRotate = autoRotateEnabled
+        }
       }
-      
+    
+      const dt = clock.getDelta()
+      if (controls) { const lerpAmt = 1 - Math.pow(1 - TARGET_LERP, dt * 60); controls.target.lerp(target_desired, lerpAmt); controls.update() }
+      if (mixer) mixer.update(dt * playbackSpeed)
+      if (modelSpinEnabled && pivot) pivot.rotation.y += modelSpinSpeed * dt
       if (groundFollow) updateGroundHeightFromBBox()
-
-
-    if (renderer?.xr?.isPresenting) {
-      renderer.render(scene!, camera!)
-    } else if (composer) {
-      composer.render()
-    } else {
-      renderer!.render(scene!, camera!)
+    
+      // ✅ SSS: update light direction every frame
+      if (_sssEnabled && keyLight && _sssUniformPools.length) {
+        keyLight.updateMatrixWorld(true)
+        keyLight.target.updateMatrixWorld(true)
+        _tmpLPos.setFromMatrixPosition(keyLight.matrixWorld)
+        _tmpLTgt.setFromMatrixPosition(keyLight.target.matrixWorld)
+        _tmpLDir.copy(_tmpLPos).sub(_tmpLTgt).normalize()
+        for (let i = 0; i < _sssUniformPools.length; i++) {
+          const u = _sssUniformPools[i]
+          if (u?.uLightDir) u.uLightDir.value.copy(_tmpLDir)
+        }
+      }
+    
+      if ((renderer as any)?.xr?.isPresenting) renderer!.render(scene!, camera!)
+      else if (composer) composer.render()
+      else renderer!.render(scene!, camera!)
     }
+    
+    // ---- radial reveal update
+    if (revealActive && pivot) {
+      const keepGoing = _updateReveal(pivot, performance.now())
+      if (!keepGoing) {
+        revealActive = false
+        _removeReveal(pivot)
+        if (controls) controls.autoRotate = autoRotateEnabled
+      }
+    }
+
+    const dt = clock.getDelta()
+    if (controls) { const lerpAmt = 1 - Math.pow(1 - TARGET_LERP, dt * 60); controls.target.lerp(target_desired, lerpAmt); controls.update() }
+    if (mixer) mixer.update(dt * playbackSpeed)
+    if (modelSpinEnabled && pivot) pivot.rotation.y += modelSpinSpeed * dt
+    if (groundFollow) updateGroundHeightFromBBox()
+
+    if ((renderer as any)?.xr?.isPresenting) renderer!.render(scene!, camera!)
+    else if (composer) composer.render()
+    else renderer!.render(scene!, camera!)
   }
+  // Update SSS light direction for all patched materials
+if (_sssEnabled && keyLight && _sssUniformPools.length) {
+  keyLight.updateMatrixWorld(true)
+  keyLight.target.updateMatrixWorld(true)
+  _tmpLPos.setFromMatrixPosition(keyLight.matrixWorld)
+  _tmpLTgt.setFromMatrixPosition(keyLight.target.matrixWorld)
+  // direction from surface toward the light (light "coming from" opposite direction)
+  _tmpLDir.copy(_tmpLPos).sub(_tmpLTgt).normalize() // light points from pos -> target; surface->light is inverse
+  for (let i = 0; i < _sssUniformPools.length; i++) {
+    const u = _sssUniformPools[i]
+    if (u?.uLightDir) u.uLightDir.value.copy(_tmpLDir)
+  }
+}
+
   renderer.setAnimationLoop(renderFrame)
 
   // Load initial model
   await loadGLB(opts.modelUrl ?? DEFAULT_MODEL_URL)
-
   target_desired.copy(centroid)
 
   return {
-
-    setOrbitTargetByName: (name: string | null) => {
-      if (!controls) return false
-      if (!name) { target_desired.copy(centroid); return true }
-      const pos = getWorldPosByName(name)
-      if (!pos) return false
-      target_desired.copy(pos)
-      return true
-    },
-
+    setOrbitTargetByName: (name: string | null) => { if (!controls) return false; if (!name) { target_desired.copy(centroid); return true } const pos = getWorldPosByName(name); if (!pos) return false; target_desired.copy(pos); return true },
     setVisibleIndices: (indices: number[] | null) => applyVisibilityMask(indices),
-
-    setBlur: (amountPx: number) => {
-      blurAmountPx = Math.max(0, amountPx | 0)
-      if (!renderer || !composer) return
-      const size = renderer.getSize(new THREE.Vector2())
-      const w = Math.max(1, size.x)
-      const h = Math.max(1, size.y)
-      const on = blurAmountPx > 0
-      if (hBlurPass && vBlurPass) {
-        hBlurPass.enabled = on
-        vBlurPass.enabled = on
-        if (on) {
-          hBlurPass.uniforms.h.value = blurAmountPx / w
-          vBlurPass.uniforms.v.value = blurAmountPx / h
-        }
-      }
-    },
-
+    setBlur: (amountPx: number) => { blurAmountPx = Math.max(0, amountPx | 0); if (!renderer || !composer) return; const size = renderer.getSize(new THREE.Vector2()); const w = Math.max(1, size.x); const h = Math.max(1, size.y); const on = blurAmountPx > 0; if (hBlurPass && vBlurPass) { hBlurPass.enabled = on; vBlurPass.enabled = on; if (on) { hBlurPass.uniforms.h.value = blurAmountPx / w; vBlurPass.uniforms.v.value = blurAmountPx / h } } },
     loadGLB,
     dispose: () => {
-
-      if (groundGroup) {
-        groundGroup.traverse((o: any) => {
-          if (o.geometry) o.geometry.dispose?.()
-          if (o.material) o.material.dispose?.()
-        })
-        scene?.remove(groundGroup)
-        groundGroup = null
-        groundMirror = null
-        groundFade = null
-      }
-      
-      if (_zoomAnimRAF !== null) { cancelAnimationFrame(_zoomAnimRAF); _zoomAnimRAF = null }
-      _explodedZoomApplied = false
-
-      ro.disconnect?.()
-      window.removeEventListener('orientationchange', sizeToContainer)
-      window.visualViewport?.removeEventListener('resize', sizeToContainer)
-      window.visualViewport?.removeEventListener('scroll', sizeToContainer)
-
+      if (groundGroup) { groundGroup.traverse((o: any) => { o.geometry?.dispose?.(); o.material?.dispose?.() }); scene?.remove(groundGroup); groundGroup = null; groundMirror = null; groundFilm = null; groundFade = null; shadowCatcher = null }
+      if (_zoomAnimRAF !== null) { cancelAnimationFrame(_zoomAnimRAF); _zoomAnimRAF = null } ; _explodedZoomApplied = false
+      ro.disconnect?.(); window.removeEventListener('orientationchange', sizeToContainer); (window as any).visualViewport?.removeEventListener('resize', sizeToContainer); (window as any).visualViewport?.removeEventListener('scroll', sizeToContainer)
       if (renderer) renderer.setAnimationLoop(null)
-
-      if (studioBackdrop) {
-        studioBackdrop.geometry?.dispose?.()
-        ;(studioBackdrop.material as any)?.dispose?.()
-        scene?.remove(studioBackdrop)
-        studioBackdrop = null
-      }
-
-      if (pivot) {
-        pivot.traverse((n: any) => {
-          if (n.isMesh) {
-            n.geometry?.dispose?.()
-            if (Array.isArray(n.material)) n.material.forEach((m: any) => m.dispose?.())
-            else n.material?.dispose?.()
-          }
-        })
-        scene?.remove(pivot)
-        pivot = null
-      }
-
+      if (studioBackdrop) { studioBackdrop.geometry?.dispose?.(); (studioBackdrop.material as any)?.dispose?.(); scene?.remove(studioBackdrop); studioBackdrop = null }
+      if (pivot) { pivot.traverse((n: any) => { if (n.isMesh) { n.geometry?.dispose?.(); if (Array.isArray(n.material)) n.material.forEach((m: any) => m.dispose?.()); else n.material?.dispose?.() } }); scene?.remove(pivot); pivot = null }
       if (renderer) { renderer.dispose(); renderer = null }
       if (mixer) { mixer.stopAllAction(); mixer = null }
       actions = {}; activeAction = null; clipNames = []; clipDurations = {}
@@ -689,225 +827,61 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
       scene = null; camera = null; currentModel = null; reticle = null
       parts = []; partNames = []; explodeState = 0
     },
-
-    // Studio
     setExposure: (expo: number) => { if (renderer) renderer.toneMappingExposure = expo },
     setAutoRotate: (enabled: boolean) => { autoRotateEnabled = enabled; if (controls) controls.autoRotate = enabled },
     resetView: () => { if (controls) { controls.target.copy(centroid); target_desired.copy(centroid) } },
-    dolly: (k: number) => {
-      if (!camera || !controls) return
-      const dir = new THREE.Vector3().subVectors(camera.position, controls.target)
-      const dist = dir.length()
-      const min = Math.max(controls.minDistance ?? 0.01, 0.01)
-      const max = Math.max(controls.maxDistance ?? 1e6, min + 1)
-      const newDist = THREE.MathUtils.clamp(dist * k, min, max)
-      dir.setLength(newDist)
-      camera.position.copy(controls.target).add(dir)
-      camera.updateProjectionMatrix()
-      controls.update()
-    },
-
-    // XR
-    enterVR: async () => {
-      if (!renderer) return
-      if (!(navigator as any).xr) { alert('WebXR not available in this browser.'); return }
-      const session = await (navigator as any).xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] })
-      await (renderer.xr as any).setSession(session)
-    },
-    enterAR: async () => {
-      if (!renderer) return
-      if (!(navigator as any).xr) { alert('WebXR not available in this browser.'); return }
-
-      try {
-        const sessionInit: XRSessionInit = {
-          requiredFeatures: ['hit-test', 'local-floor'],
-          optionalFeatures: ['dom-overlay'],
-          domOverlay: { root: mountEl! }
-        } as any
-
-        const session = await (navigator as any).xr.requestSession('immersive-ar', sessionInit)
-        await (renderer.xr as any).setSession(session)
-
-        xrRefSpace = await session.requestReferenceSpace('local')
-        const viewerSpace = await session.requestReferenceSpace('viewer')
-        xrHitSource = await (session as any).requestHitTestSource({ space: viewerSpace })
-
-        session.addEventListener('select', () => {
-          if (reticle && currentModel) {
-            currentModel.position.setFromMatrixPosition(reticle.matrix)
-            currentModel.visible = true
-          }
-        })
-
-        const onXRFrame = (_time: number, frame: XRFrame) => {
-          frame.getViewerPose(xrRefSpace!)
-          if (xrHitSource) {
-            const hits = frame.getHitTestResults(xrHitSource)
-            if (hits.length && reticle) {
-              const hitPose = hits[0].getPose(xrRefSpace!)
-              if (hitPose) {
-                reticle.visible = true
-                reticle.matrix.fromArray(hitPose.transform.matrix)
-                reticle.matrix.decompose(reticle.position, reticle.quaternion, reticle.scale)
-              }
-            } else if (reticle) reticle.visible = false
-          }
-          renderer!.render(scene!, camera!)
-          frame.session.requestAnimationFrame(onXRFrame)
-        }
-        ;(session as any).requestAnimationFrame(onXRFrame)
-      } catch (err) {
-        console.error('Failed to start AR session', err)
-        alert('Failed to start AR session on this device.')
-      }
-    },
-
-    // Explosion/animation
+    dolly: (k: number) => { if (!camera || !controls) return; const dir = new THREE.Vector3().subVectors(camera.position, controls.target); const dist = dir.length(); const min = Math.max(controls.minDistance ?? 0.01, 0.01); const max = Math.max(controls.maxDistance ?? 1e6, min + 1); const newDist = THREE.MathUtils.clamp(dist * k, min, max); dir.setLength(newDist); camera.position.copy(controls.target).add(dir); camera.updateProjectionMatrix(); controls.update() },
+    enterVR: async () => { if (!renderer) return; if (!(navigator as any).xr) { alert('WebXR not available in this browser.'); return } const session = await (navigator as any).xr.requestSession('immersive-vr', { optionalFeatures: ['local-floor', 'bounded-floor'] }); await (renderer.xr as any).setSession(session) },
+    enterAR: async () => { if (!renderer) return; if (!(navigator as any).xr) { alert('WebXR not available in this browser.'); return } try { const sessionInit: XRSessionInit = { requiredFeatures: ['hit-test', 'local-floor'], optionalFeatures: ['dom-overlay'], domOverlay: { root: mountEl! } } as any; const session = await (navigator as any).xr.requestSession('immersive-ar', sessionInit); await (renderer.xr as any).setSession(session); xrRefSpace = await session.requestReferenceSpace('local'); const viewerSpace = await session.requestReferenceSpace('viewer'); xrHitSource = await (session as any).requestHitTestSource({ space: viewerSpace }); session.addEventListener('select', () => { if (reticle && currentModel) { currentModel.position.setFromMatrixPosition(reticle.matrix); currentModel.visible = true } }); const onXRFrame = (_time: number, frame: XRFrame) => { frame.getViewerPose(xrRefSpace!); if (xrHitSource) { const hits = frame.getHitTestResults(xrHitSource); if (hits.length && reticle) { const hitPose = hits[0].getPose(xrRefSpace!); if (hitPose) { reticle.visible = true; reticle.matrix.fromArray(hitPose.transform.matrix); reticle.matrix.decompose(reticle.position, reticle.quaternion, reticle.scale) } } else if (reticle) reticle.visible = false } renderer!.render(scene!, camera!); frame.session.requestAnimationFrame(onXRFrame) }; (session as any).requestAnimationFrame(onXRFrame) } catch (err) { console.error('Failed to start AR session', err); alert('Failed to start AR session on this device.') } },
     setExplode: (t: number) => {
-      
       if (!mixer || !Object.keys(actions).length) return
       t = THREE.MathUtils.clamp(t, 0, 1)
-
       if (t <= 0) {
         if (explodeState === 1) {
-          Object.entries(actions).forEach(([name, a]) => {
-            const dur = clipDurations[name] ?? a.getClip().duration
-            a.enabled = true
-            a.setLoop(THREE.LoopOnce, 0)
-            a.clampWhenFinished = true
-            a.reset()
-            a.setEffectiveWeight(1)
-            a.setEffectiveTimeScale(-1)
-            a.time = Math.max(0, dur - 1e-6)
-            a.paused = false
-            a.play()
-          })
+          Object.entries(actions).forEach(([name, a]) => { const dur = clipDurations[name] ?? a.getClip().duration; a.enabled = true; a.setLoop(THREE.LoopOnce, 0); a.clampWhenFinished = true; a.reset(); a.setEffectiveWeight(1); a.setEffectiveTimeScale(-1); a.time = Math.max(0, dur - 1e-6); a.paused = false; a.play() })
         } else {
-          Object.values(actions).forEach(a => {
-            a.enabled = true
-            a.setLoop(THREE.LoopOnce, 0)
-            a.clampWhenFinished = true
-            a.reset()
-            a.paused = true
-            a.setEffectiveWeight(1)
-            a.setEffectiveTimeScale(1)
-            a.time = 0
-          })
-          mixer.update(1e-6)
+          Object.values(actions).forEach(a => { a.enabled = true; a.setLoop(THREE.LoopOnce, 0); a.clampWhenFinished = true; a.reset(); a.paused = true; a.setEffectiveWeight(1); a.setEffectiveTimeScale(1); a.time = 0 }); mixer.update(1e-6)
         }
-        clearExplodedZoom()
-        explodeState = 0
-        return
+        clearExplodedZoom(); explodeState = 0; return
       }
-
       if (t >= 1) {
         if (explodeState === 1) {
-          Object.entries(actions).forEach(([name, a]) => {
-            const dur = clipDurations[name] ?? a.getClip().duration
-            a.enabled = true
-            a.setLoop(THREE.LoopOnce, 0)
-            a.clampWhenFinished = true
-            a.reset()
-            a.paused = true
-            a.setEffectiveWeight(1)
-            a.setEffectiveTimeScale(1)
-            a.time = dur
-          })
-          mixer.update(1e-6)
+          Object.entries(actions).forEach(([name, a]) => { const dur = clipDurations[name] ?? a.getClip().duration; a.enabled = true; a.setLoop(THREE.LoopOnce, 0); a.clampWhenFinished = true; a.reset(); a.paused = true; a.setEffectiveWeight(1); a.setEffectiveTimeScale(1); a.time = dur }); mixer.update(1e-6)
         } else {
-          Object.values(actions).forEach(a => {
-            a.enabled = true
-            a.setLoop(THREE.LoopOnce, 0)
-            a.clampWhenFinished = true
-            a.reset()
-            a.setEffectiveWeight(1)
-            a.setEffectiveTimeScale(1)
-            a.paused = false
-            a.play()
-          })
+          Object.values(actions).forEach(a => { a.enabled = true; a.setLoop(THREE.LoopOnce, 0); a.clampWhenFinished = true; a.reset(); a.setEffectiveWeight(1); a.setEffectiveTimeScale(1); a.paused = false; a.play() })
         }
-        applyExplodedZoom()
-        explodeState = 1
-        return
+        applyExplodedZoom(); explodeState = 1; return
       }
-
-      // Scrub (0..1)
-      Object.entries(actions).forEach(([name, a]) => {
-        const dur = clipDurations[name] ?? a.getClip().duration
-        a.enabled = true
-        a.play()
-        a.paused = true
-        a.setEffectiveWeight(1)
-        a.time = dur * t
-      })
-      mixer.update(0)
+      Object.entries(actions).forEach(([name, a]) => { const dur = clipDurations[name] ?? a.getClip().duration; a.enabled = true; a.play(); a.paused = true; a.setEffectiveWeight(1); a.time = dur * t }); mixer.update(0)
     },
-
-    setOrbitTargetTo: (index: number | null) => {
-      if (!controls) return
-      if (index === null || index < 0 || index >= parts.length) {
-        target_desired.copy(centroid)
-      } else {
-        const c = getPartWorldCenter(index)
-        target_desired.copy(c)
-      }
-    },
+    setOrbitTargetTo: (index: number | null) => { if (!controls) return; if (index === null || index < 0 || index >= parts.length) { target_desired.copy(centroid) } else { const c = getPartWorldCenter(index); target_desired.copy(c) } },
     isolateIndex: (i: number | null, dimOpacity = 0.22) => isolatePart(i, dimOpacity),
     partCount: () => parts.length,
     getPartNames: () => [...partNames],
-
-    // Animation API
     getAnimations: () => [...clipNames],
-    playAnimation: (name?: string, fadeSeconds = 0.25, loopMode: 'once'|'repeat'|'pingpong' = 'repeat'): string | null => {
-      if (!mixer || clipNames.length === 0) return null
-      const target = name && actions[name] ? name : clipNames[0]
-      const next = actions[target]
-      if (!next) return null
-      if (loopMode === 'once') { next.setLoop(THREE.LoopOnce, 0); next.clampWhenFinished = true }
-      else if (loopMode === 'pingpong') { next.setLoop(THREE.LoopPingPong, Infinity); next.clampWhenFinished = false }
-      else { next.setLoop(THREE.LoopRepeat, Infinity); next.clampWhenFinished = false }
-      if (activeAction && activeAction !== next) {
-        activeAction.crossFadeTo(next.reset().play(), fadeSeconds, false)
-      } else {
-        next.reset().fadeIn(fadeSeconds).play()
-      }
-      activeAction = next
-      return target
-    },
+    playAnimation: (name?: string, fadeSeconds = 0.25, loopMode: 'once'|'repeat'|'pingpong' = 'repeat'): string | null => { if (!mixer || clipNames.length === 0) return null; const target = name && actions[name] ? name : clipNames[0]; const next = actions[target]; if (!next) return null; if (loopMode === 'once') { next.setLoop(THREE.LoopOnce, 0); next.clampWhenFinished = true } else if (loopMode === 'pingpong') { next.setLoop(THREE.LoopPingPong, Infinity); next.clampWhenFinished = false } else { next.setLoop(THREE.LoopRepeat, Infinity); next.clampWhenFinished = false } if (activeAction && activeAction !== next) { activeAction.crossFadeTo(next.reset().play(), fadeSeconds, false) } else { next.reset().fadeIn(fadeSeconds).play() } activeAction = next; return target },
     stopAnimation: () => { if (mixer) mixer.stopAllAction(); activeAction = null },
     pauseAnimation: () => { if (activeAction) activeAction.paused = true },
     resumeAnimation: () => { if (activeAction) activeAction.paused = false },
-    setAnimationSpeed: (speed: number) => {
-      playbackSpeed = Math.max(0, speed)
-      Object.values(actions).forEach(a => a.setEffectiveTimeScale(Math.sign(a.getEffectiveTimeScale()) || 1))
-    },
-
-    setBloom: ({ enabled, threshold, strength, radius }) => {
-      if (typeof enabled === 'boolean' && bloomPass) bloomPass.enabled = enabled
-      if (typeof threshold === 'number' && bloomPass) bloomPass.threshold = threshold
-      if (typeof strength === 'number' && bloomPass) bloomPass.strength = strength
-      if (typeof radius === 'number' && bloomPass) bloomPass.radius = radius
-    },
-  
+    setAnimationSpeed: (speed: number) => { playbackSpeed = Math.max(0, speed); Object.values(actions).forEach(a => a.setEffectiveTimeScale(Math.sign(a.getEffectiveTimeScale()) || 1)) },
+    setBloom: ({ enabled, threshold, strength, radius }) => { if (typeof enabled === 'boolean' && bloomPass) bloomPass.enabled = enabled; if (typeof threshold === 'number' && bloomPass) bloomPass.threshold = threshold; if (typeof strength === 'number' && bloomPass) bloomPass.strength = strength; if (typeof radius === 'number' && bloomPass) bloomPass.radius = radius },
   }
+  
 }
 
 export function disposeViewer(h: ViewerHandle) { h.dispose() }
-const REFLECT_RES_SCALE = 0.25 // keep if you like the softer reflection
 
+const REFLECT_RES_SCALE = 0.25 // keep low for softer reflection
 let groundBaseY = 0
 let groundFollow = true
-const GROUND_PAD = 0.01
+const GROUND_PAD = 0
 
 function addReflectiveGround(y: number) {
   if (!scene || !renderer) return
 
   // cleanup previous
   if (groundGroup) {
-    groundGroup.traverse((o: any) => {
-      if (o.geometry) o.geometry.dispose?.()
-      if (o.material) o.material.dispose?.()
-    })
+    groundGroup.traverse((o: any) => { o.geometry?.dispose?.(); o.material?.dispose?.() })
     scene.remove(groundGroup)
   }
   groundGroup = new THREE.Group()
@@ -916,108 +890,90 @@ function addReflectiveGround(y: number) {
   const radius = 40
   const segs = 128
 
-  const pxRatio = Math.min(renderer.getPixelRatio(), 2)
-  const width  = Math.round((renderer.domElement.width  || 1600) * 0.6 * pxRatio * REFLECT_RES_SCALE)
-  const height = Math.round((renderer.domElement.height ||  900) * 0.6 * pxRatio * REFLECT_RES_SCALE)
+  // No mirror
+  groundMirror = null as any
 
-  // --- MIRROR (Reflector)
-  groundMirror = new Reflector(
-    new THREE.CircleGeometry(radius, segs),
-    {
-      clipBias: 0.003,
-      textureWidth: width,
-      textureHeight: height,
-      color: GROUND_TINT,
-    }
+  // 1) BASE SHADOW CATCHER — receives the real light shadow
+  shadowCatcher = new THREE.Mesh(
+    new THREE.CircleGeometry(radius * 1, segs),
+    new THREE.ShadowMaterial({ opacity: SHADOW_BASE_OPACITY, color: 0x252525})
   )
-  // ⬇️ these were missing
-  groundMirror.rotateX(-Math.PI / 2)
-  groundMirror.position.set(0, y, 0)
-  ;(groundMirror as any).material.depthWrite = false
-  ;(groundMirror as any).material.polygonOffset = true
-  ;(groundMirror as any).material.polygonOffsetFactor = 0
-  ;(groundMirror as any).material.polygonOffsetUnits = -2
-  ;(groundMirror as any).renderOrder = 0
-  groundGroup.add(groundMirror as unknown as THREE.Object3D)
+  shadowCatcher.rotateX(-Math.PI / 2)
+  shadowCatcher.position.set(0, y + 0.00012, 0)
+  shadowCatcher.receiveShadow = true
+  const sm = shadowCatcher.material as THREE.ShadowMaterial
+  sm.transparent = true
+  // tiny offset avoids z-fighting with the overlays
+  sm.polygonOffset = true; sm.polygonOffsetFactor = 1; sm.polygonOffsetUnits = 1
+  shadowCatcher.renderOrder = 1
+  groundGroup.add(shadowCatcher)
 
-  // --- FILM (subtle glossy veil)
-  groundFilm = new THREE.Mesh(
-    new THREE.CircleGeometry(radius, segs),
-    new THREE.MeshStandardMaterial({
-      color: GROUND_SHEEN_COLOR,
-      roughness: 0.88,
-      metalness: 0.0,
-      transparent: true,
-      opacity: GROUND_SHEEN_OPAC,
-      depthWrite: false,
+  // 2) DARK CORE OVERLAY — unlit, just multiplies darkness in center
+  const core = new THREE.Mesh(
+    new THREE.CircleGeometry(radius * SHADOW_CORE_SCALE, segs),
+    new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, depthTest: true,
+      uniforms: { uOpacity: { value: SHADOW_CORE_OPACITY } },
+      vertexShader: `
+        varying vec2 vUv; void main(){
+          vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0);
+        }`,
+      fragmentShader: `
+        varying vec2 vUv; uniform float uOpacity;
+        void main(){
+          vec2 p = vUv*2.0-1.0;
+          float d = length(p);
+          float a = 1.0 - smoothstep(0.0, 1.0, d); // darkest at center
+          gl_FragColor = vec4(0.0,0.0,0.0, a * uOpacity);
+        }`
     })
   )
-  groundFilm.rotateX(-Math.PI / 2)
-  groundFilm.position.set(0, y + 0.0002, 0)
-  groundFilm.renderOrder = 1
-  groundGroup.add(groundFilm)
+  core.rotateX(-Math.PI / 2)
+  core.position.set(0, y + 0.00013, 0)
+  core.renderOrder = 2
+  groundGroup.add(core)
 
-  // --- FADE (no hard edge)
-  const fadeGeo = new THREE.CircleGeometry(radius, segs)
-  const fadeMat = new THREE.ShaderMaterial({
-    transparent: true,
-    depthWrite: false,
-    depthTest: true,
-    uniforms: {
-      uColor:   { value: new THREE.Color(GROUND_FADE_COLOR) },
-      uOpacity: { value: GROUND_FADE_OPAC },
-      uInner:   { value: 0.15 },
-      uOuter:   { value: 0.98 },
-    },
-    vertexShader: `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }
-    `,
-    fragmentShader: `
-      varying vec2 vUv;
-      uniform vec3 uColor;
-      uniform float uOpacity;
-      uniform float uInner;
-      uniform float uOuter;
-      void main() {
-        vec2 p = vUv * 2.0 - 1.0;
-        float d = length(p);
-        float a = 1.0 - smoothstep(uInner, uOuter, d);
-        gl_FragColor = vec4(uColor, a * uOpacity);
-      }
-    `
-  })
-  groundFade = new THREE.Mesh(fadeGeo, fadeMat)
-  groundFade.rotateX(-Math.PI / 2)
-  groundFade.position.set(0, y + 0.0003, 0)
-  groundFade.renderOrder = 2
-  groundGroup.add(groundFade)
+  // 3) VERY SOFT EDGE FEATHER — unlit ring to blur the outer penumbra
+  const feather = new THREE.Mesh(
+    new THREE.CircleGeometry(radius, segs),
+    new THREE.ShaderMaterial({
+      transparent: true, depthWrite: false, depthTest: true,
+      uniforms: {
+        uOpacity: { value: SHADOW_FEATHER_OPAC },
+        uInner:   { value: SHADOW_FEATHER_INNER },
+        uOuter:   { value: SHADOW_FEATHER_OUTER },
+      },
+      vertexShader: `
+        varying vec2 vUv; void main(){
+          vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0);
+        }`,
+      fragmentShader: `
+        varying vec2 vUv; uniform float uOpacity, uInner, uOuter;
+        void main(){
+          vec2 p = vUv*2.0-1.0;
+          float d = length(p);
+          float ring = smoothstep(uInner, uOuter, d) * (1.0 - smoothstep(uOuter-0.02, uOuter, d));
+          gl_FragColor = vec4(0.0,0.0,0.0, ring * uOpacity);
+        }`
+    })
+  )
+  feather.rotateX(-Math.PI / 2)
+  feather.position.set(0, y + 0.00014, 0)
+  feather.renderOrder = 3
+  groundGroup.add(feather)
+
+  // Reuse existing refs so your updateGroundHeightFromBBox keeps them aligned
+  groundFilm = core        // piggyback these names
+  groundFade = feather     // so the height-follow code still works
 }
-
-
 
 // ---------- Load GLB
 async function loadGLB(fileOrUrl: File | string) {
   if (!scene) return
-
-  if (_zoomAnimRAF !== null) { cancelAnimationFrame(_zoomAnimRAF); _zoomAnimRAF = null }
-  _explodedZoomApplied = false
+  if (_zoomAnimRAF !== null) { cancelAnimationFrame(_zoomAnimRAF); _zoomAnimRAF = null } ; _explodedZoomApplied = false
 
   // Clear previous model (pivot and children)
-  if (pivot) {
-    pivot.traverse((n: any) => {
-      if (n.isMesh) {
-        n.geometry?.dispose?.()
-        if (Array.isArray(n.material)) n.material.forEach((m: any) => m.dispose?.())
-        else n.material?.dispose?.()
-      }
-    })
-    scene.remove(pivot)
-    pivot = null
-  }
+  if (pivot) { pivot.traverse((n: any) => { if (n.isMesh) { n.geometry?.dispose?.(); if (Array.isArray(n.material)) n.material.forEach((m: any) => m.dispose?.()); else n.material?.dispose?.() } }); scene.remove(pivot); pivot = null }
   currentModel = null
   if (mixer) { mixer.stopAllAction(); mixer = null }
   actions = {}; activeAction = null; clipNames = []; clipDurations = {}
@@ -1025,13 +981,7 @@ async function loadGLB(fileOrUrl: File | string) {
   explodeState = 0
 
   const loader = new GLTFLoader()
-  try {
-    const draco = new DRACOLoader()
-    draco.setDecoderPath(DRACO_PATH)
-    loader.setDRACOLoader(draco)
-  } catch {
-    console.warn('DRACOLoader not available; loading without it.')
-  }
+  try { const draco = new DRACOLoader(); draco.setDecoderPath(DRACO_PATH); loader.setDRACOLoader(draco) } catch { console.warn('DRACOLoader not available; loading without it.') }
 
   const url = (typeof fileOrUrl === 'string') ? fileOrUrl : URL.createObjectURL(fileOrUrl)
 
@@ -1042,55 +992,68 @@ async function loadGLB(fileOrUrl: File | string) {
         const root = gltf.scene || (gltf.scenes && gltf.scenes[0])
         if (!root) { reject(new Error('GLTF has no scene')); return }
 
-        // Mesh setup
         root.traverse((obj: any) => {
           if (obj.isMesh) {
-            // Mobile: avoid real-time shadows (banding + perf), lean on env + rig
-            obj.castShadow = false
-            obj.receiveShadow = false
+            if (initOpts.enableShadows) { obj.castShadow = true; obj.receiveShadow = true } else { obj.castShadow = false; obj.receiveShadow = false }
           }
-
         })
 
         cloneMaterials(root)
+        polishPBRMaterials(root)
         normalizeImportedLights(root)
-
-        // Subtle reflection boost for a clean studio look
         setEnvIntensity(root, initOpts.envIntensity ?? 1.15)
 
+        centerRootUnderPivot(root); scene!.add(pivot!)
 
-        // Center under pivot and add to scene
-        centerRootUnderPivot(root)
-        scene!.add(pivot!)
+        parts = gatherParts(root); promoteSectionNamesToParts(parts); partNames = parts.map((p, i) => p.name || `Part ${i + 1}`)
 
-        // Build parts and promote section names if inner nodes carry them
-        parts = gatherParts(root)
-        promoteSectionNamesToParts(parts)
-        partNames = parts.map((p, i) => p.name || `Part ${i + 1}`)
-
-        // Stats based on pivot (now centered at origin)
         computeModelStats(pivot!)
+        if (scene) {
+          const dl = scene.children.find((o:any)=>o.isDirectionalLight) as THREE.DirectionalLight | undefined
+          if (dl) fitDirLightShadowToBBox(dl, bbox)
+        }
 
-        // One-time fit to view using centered pivot
         fitCameraToObject(pivot!, INITIAL_FRAME_PADDING)
-        if (INITIAL_ZOOM_FACTOR !== 5) dollyScaleSmooth(INITIAL_ZOOM_FACTOR, 0)
+
+        // ---- Reveal setup (single, de-duplicated block)
+        if (REVEAL_DURATION_MS > 0) {
+          // compute world-space pivot center
+          revealCenterW.set(0,0,0)
+          if (pivot) pivot.localToWorld(revealCenterW.set(0,0,0))
+
+          // half-diagonal for max radius
+          const size = new THREE.Vector3()
+          bbox.getSize(size)
+          revealMaxR = 0.5 * Math.sqrt(size.x*size.x + size.y*size.y + size.z*size.z)
+
+          const softDist = REVEAL_SOFTNESS * revealMaxR
+          _applyRevealToRoot(root, softDist)
+
+          // prime: small but >0 so something is visible on frame 1
+          root.traverse((o:any)=>{
+            if (!o.isMesh) return
+            const mats = Array.isArray(o.material) ? o.material : [o.material]
+            mats.forEach((mat:any)=>{
+              const u = mat.userData?.__revealUniforms
+              if (u) { u.uCenter.value.copy(revealCenterW); u.uR.value = 1e-3; u.uTime.value = 0.0 }
+            })
+          })
+
+          if (controls) controls.autoRotate = false
+          revealActive = true
+          revealStartT = performance.now()
+        }
+
+        if (INITIAL_ZOOM_FACTOR !== 1.5) dollyScaleSmooth(INITIAL_ZOOM_FACTOR, 0)
 
         // Animations
         if (gltf.animations && gltf.animations.length) {
-          mixer = new THREE.AnimationMixer(root) // animate the content inside pivot
+          mixer = new THREE.AnimationMixer(root)
           gltf.animations.forEach((clip: THREE.AnimationClip, i: number) => {
             const name = clip.name?.length ? clip.name : `Clip_${i}`
             const action = mixer!.clipAction(clip)
-            action.enabled = true
-            action.setLoop(THREE.LoopOnce, 0)
-            action.clampWhenFinished = true
-            action.reset()
-            action.paused = true
-            action.setEffectiveWeight(1)
-            action.setEffectiveTimeScale(1)
-            actions[name] = action
-            clipNames.push(name)
-            clipDurations[name] = clip.duration
+            action.enabled = true; action.setLoop(THREE.LoopOnce, 0); action.clampWhenFinished = true; action.reset(); action.paused = true; action.setEffectiveWeight(1); action.setEffectiveTimeScale(1)
+            actions[name] = action; clipNames.push(name); clipDurations[name] = clip.duration
           })
           mixer.update(1e-6)
           explodeState = 0
@@ -1105,12 +1068,140 @@ async function loadGLB(fileOrUrl: File | string) {
   })
 
   // Place ground at model base with a tiny offset
-const baseY = bbox.min.y - 0.001
-addReflectiveGround(baseY)
-// Place ground at model base with a tiny offset
-groundBaseY = bbox.min.y - GROUND_PAD
-addReflectiveGround(groundBaseY)
+  groundBaseY = bbox.min.y - GROUND_PAD
+  addReflectiveGround(groundBaseY)
+}
+function _injectSSSShader(m: any, opts: SSSOpts = {}) {
+  if (!m || m.userData?.__sssPatched) return
+  m.userData ??= {}
+  m.userData.__sssPatched = true
 
+  const cfg = {
+    color: new THREE.Color(opts.color ?? 0xffc7a6),
+    strength: opts.strength ?? 0.45,
+    wrap: opts.wrap ?? 0.45,
+    power: opts.power ?? 4.0,
+    thickness: opts.thickness ?? 0.7,
+  }
+
+  const prev = m.onBeforeCompile
+  m.onBeforeCompile = (shader: any) => {
+    prev?.(shader)
+
+    shader.uniforms.uSSSColor     = { value: cfg.color }
+    shader.uniforms.uSSSStrength  = { value: cfg.strength }
+    shader.uniforms.uSSSWrap      = { value: cfg.wrap }
+    shader.uniforms.uSSSPower     = { value: cfg.power }
+    shader.uniforms.uSSSThickness = { value: cfg.thickness }
+    shader.uniforms.uLightDir     = { value: new THREE.Vector3(0, -1, 0) }
+
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWorldNormal;')
+      .replace('#include <beginnormal_vertex>', '#include <beginnormal_vertex>\nvWorldNormal = normalize(mat3(modelMatrix) * objectNormal);')
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+varying vec3 vWorldNormal;
+uniform vec3  uSSSColor;
+uniform float uSSSStrength, uSSSWrap, uSSSPower, uSSSThickness;
+uniform vec3  uLightDir;
+float saturate(float x){ return clamp(x,0.0,1.0); }`)
+
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <lights_fragment_begin>',
+      `#include <lights_fragment_begin>
+      vec3 n  = normalize(vWorldNormal);
+      vec3 ld = normalize(uLightDir);
+      float wrapN = (dot(n, ld) + uSSSWrap) / (1.0 + uSSSWrap);
+      wrapN = saturate(wrapN);
+      float back = pow( saturate(dot(n, -ld)), uSSSPower );
+      vec3 sssTerm = uSSSColor * (wrapN + back) * uSSSThickness * uSSSStrength;
+      outgoingLight += sssTerm;
+      `
+    )
+
+    _sssUniformPools.push(shader.uniforms)
+    _sssEnabled = true
+  }
+
+  m.needsUpdate = true
+}
+
+function _injectRevealShader(m: any) {
+  
+  if (!m || m.userData?.__revealPatched) return
+
+  // Stash desired defaults so we can apply them on first compile
+  m.userData ??= {}
+  m.userData.__revealPatched = true
+  m.userData.__revealDefaults = m.userData.__revealDefaults || {
+    uSoft: 1.0,
+    uAmp: REVEAL_RIPPLE_AMP,
+    uFreq: REVEAL_RIPPLE_FREQ,
+  }
+
+  m.onBeforeCompile = (shader: any) => {
+    // uniforms
+    shader.uniforms.uCenter = { value: revealCenterW.clone() }
+    shader.uniforms.uR      = { value: 0.0 }
+    shader.uniforms.uSoft   = { value: m.userData.__revealDefaults.uSoft }
+    shader.uniforms.uAmp    = { value: m.userData.__revealDefaults.uAmp }
+    shader.uniforms.uFreq   = { value: m.userData.__revealDefaults.uFreq }
+    shader.uniforms.uTime   = { value: 0.0 }
+
+    // world position varying
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPos;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWorldPos = (modelMatrix * vec4(transformed,1.0)).xyz;')
+
+    // declarations in fragment
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+varying vec3 vWorldPos;
+uniform vec3  uCenter;
+uniform float uR, uSoft, uAmp, uFreq, uTime;`)
+
+    // Compute edge once per fragment
+    const EDGE_CODE = `
+      float d = length(vWorldPos - uCenter);
+      float ripple = sin(d * uFreq - uTime) * uAmp;
+      float edge = 1.0 - smoothstep(uR - uSoft + ripple, uR + uSoft + ripple, d);
+    `
+
+    // Primary path (modern three): replace output chunk
+    if (shader.fragmentShader.includes('#include <output_fragment>')) {
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <output_fragment>',
+        `
+          ${EDGE_CODE}
+          // stock output but with revealed alpha
+          gl_FragColor = vec4( outgoingLight, diffuseColor.a * edge );
+        `
+      )
+    } else {
+      // Fallback path (older builds): patch the final write
+      shader.fragmentShader = shader.fragmentShader.replace(
+        'void main() {',
+        `void main() {
+${EDGE_CODE}`
+      )
+      shader.fragmentShader = shader.fragmentShader.replace(
+        'gl_FragColor = vec4( outgoingLight, diffuseColor.a );',
+        'gl_FragColor = vec4( outgoingLight, diffuseColor.a * edge );'
+      )
+    }
+
+    // Expose uniforms for runtime updates
+    m.userData.__revealUniforms = shader.uniforms
+  }
+
+  // ensure blending really happens
+  m.transparent = true
+  m.depthWrite  = false
+  ;(m as any).alphaTest = 0.0
+  m.blending = THREE.NormalBlending
+
+  m.needsUpdate = true
 }
 
 // Fit camera to object (centered pivot)
@@ -1123,14 +1214,12 @@ function fitCameraToObject(obj: THREE.Object3D, padding = 1.2) {
   const maxDim = Math.max(size.x, size.y, size.z)
   const fov = THREE.MathUtils.degToRad(camera.fov)
   const dist = (maxDim / (2 * Math.tan(fov / 2))) * padding
-
   const viewDir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize()
   if (!isFinite(viewDir.length())) viewDir.set(0, 0, 1)
-
   camera.position.copy(center).add(viewDir.multiplyScalar(dist))
   camera.near = Math.max(0.01, dist / 100)
   camera.far = Math.max(camera.near * 10, dist * 50)
   camera.updateProjectionMatrix()
-  controls.target.copy(center) // ~ (0,0,0)
+  controls.target.copy(center)
   controls.update()
 }

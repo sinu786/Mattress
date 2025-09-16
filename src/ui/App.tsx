@@ -464,6 +464,10 @@ function getStageCopy(stage: number, parts: NamedPart[]) {
         titleText = 'Individually tuned springs'
         subText = 'Active lift with motion isolation across the bed'
         break
+        case 5:
+          titleText = 'Individually tuned springs'
+          subText = 'Active lift with motion isolation across the bed'
+          break
       default:
         titleText = p?.name ?? 'Section'
         subText = 'Focus on this layer'
