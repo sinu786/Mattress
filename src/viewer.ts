@@ -91,7 +91,7 @@ const DEFAULT_MODEL_URL = `${BASE}assets/bed.glb`
 const DRACO_PATH = `${BASE}draco/`
 
 // Soft shadow knobs
-const SHADOW_MAP_SIZE  = 4096// 1024–2048 is a good range for mobile
+const SHADOW_MAP_SIZE  = 1024// 1024–2048 is a good range for mobile
 const SHADOW_RADIUS    = 100   // VSM blur radius or PCFSoft softness hint
 // Contact shadow shaping (tweak to taste)
 const SHADOW_BASE_OPACITY   = .9  // actual received shadow
