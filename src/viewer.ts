@@ -428,7 +428,7 @@ function addMobileLightRig() {
   key.castShadow = true
 
   // Bigger atlas = fewer jaggies before blur
-  const sms = initOpts.shadowMapSize ?? 4096
+  const sms = initOpts.shadowMapSize ?? 1024
   key.shadow.mapSize.set(sms, sms)
 
   // Keep frustum tight (your fitDirLightShadowToBBox already helps)
