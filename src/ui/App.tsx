@@ -1,6 +1,6 @@
 // src/ui/App.tsx
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import type { ViewerHandle, InitOptions } from '../viewer.ts'
+import type { ViewerHandle, InitOptions } from '../viewer'
 import './app.css'
 
 type NamedPart = { name: string; index: number; num: number }
@@ -39,6 +39,8 @@ export default function App() {
 
   // ---------- init viewer
   useEffect(() => {
+
+    
     if (!mountRef.current) return
     let cleanup = () => {}
 
@@ -64,7 +66,20 @@ export default function App() {
         toneMappingExposure: exposure,
         bloomEnabled: true,
         scrollScrub: false,
+      
+        toneInit: {
+          curve: 'ACES',
+          exposure: 1.1,                       // a touch lower = cleaner highlights
+          lift:  [-0.015, -0.015, -0.015],      // gently deepen blacks (more punch)
+          gamma: [ 1.02,  1.00,  0.98],         // tame reds a hair, open blue mids
+          gain:  [ 1.03,  1.02,  1.05],         // tiny cool tilt in highlights
+          warmth: 1 ,                        // almost neutral (was 0.65)
+          saturation: 1,
+          vibrance: -.1,
+          contrast: 1.01,
+        }
       })
+      
       setHandle(h)
 
       const names = h.getPartNames?.() ?? []

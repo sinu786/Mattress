@@ -21,6 +21,8 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js'
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js'
 import { HorizontalBlurShader } from 'three/examples/jsm/shaders/HorizontalBlurShader.js'
 import { VerticalBlurShader } from 'three/examples/jsm/shaders/VerticalBlurShader.js'
+import { ExposureShader } from 'three/examples/jsm/Addons.js'
+import { VignetteShader } from 'three/examples/jsm/shaders/VignetteShader.js'
 
 // ---- Bullet-proof program cache key guard (place BEFORE creating any materials) ----
 (() => {
@@ -55,13 +57,76 @@ import { VerticalBlurShader } from 'three/examples/jsm/shaders/VerticalBlurShade
 
     proto[FLAG] = true;
   };
-
-  // Patch Material + the common PBR subclasses that have their own cache keys
+// Patch Material + the common PBR subclasses that have their own cache keys
   decorate((THREE as any).Material?.prototype);
   decorate((THREE as any).MeshStandardMaterial?.prototype);
   decorate((THREE as any).MeshPhysicalMaterial?.prototype);
   decorate((THREE as any).ShaderMaterial?.prototype);
 })();
+// --- LiftGammaGain + Warmth shader (tiny, fast) ---
+const LggWarmthShader = {
+  uniforms: {
+    uSaturation: { value: 1.0 },  // 1 = neutral, >1 = more color
+  uVibrance:   { value: 0.0 },  // 0..1 (protects already-saturated colors)
+  uContrast:   { value: 1.0 },  // 1 = neutral
+
+    tDiffuse: { value: null },
+    uLift:    { value: new THREE.Vector3(0, 0, 0) },     // -0.1..+0.1
+    uGamma:   { value: new THREE.Vector3(1, 1, 1) },     // 0.85..1.15
+    uGain:    { value: new THREE.Vector3(1, 1, 1) },     // 0.9..1.2
+    uWarmth:  { value: 0.0 },                             // -1 (cool) .. +1 (warm)
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main(){ vUv = uv; gl_Position = projectionMatrix*modelViewMatrix*vec4(position,1.0); }
+  `,
+  fragmentShader: `
+varying vec2 vUv;
+uniform sampler2D tDiffuse;
+uniform vec3 uLift, uGamma, uGain;
+uniform float uWarmth, uSaturation, uVibrance, uContrast;
+
+float luma(vec3 c){ return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec3 applyLGG(vec3 c){
+  c = c + uLift;
+  c = max(c, vec3(0.0));
+  c = pow(c, uGamma);
+  c = c * uGain;
+  return c; // keep HDR
+}
+vec3 applyWarmth(vec3 c){
+  vec3 w = vec3(1.0 + 0.08*uWarmth, 1.0, 1.0 - 0.08*uWarmth);
+  return c * w; // keep HDR
+}
+vec3 applySaturation(vec3 c){
+  float Y = luma(c);
+  return mix(vec3(Y), c, uSaturation); // uSaturation>1 pushes away from luma
+}
+vec3 applyVibrance(vec3 c){
+  float sat = max(c.r, max(c.g, c.b)) - min(c.r, min(c.g, c.b));
+  float amt = uVibrance * (1.0 - sat); // boost low/med saturation, spare already-hot colors
+  float Y = luma(c);
+  return mix(vec3(Y), c, 1.0 + amt);
+}
+vec3 applyContrast(vec3 c){
+  // simple pivot at mid-gray; HDR-safe (no clamp), then guard negatives
+  c = (c - 0.5) * uContrast + 0.5;
+  return max(c, 0.0);
+}
+
+void main(){
+  vec3 c = texture2D(tDiffuse, vUv).rgb;
+  c = applyLGG(c);
+  c = applyWarmth(c);
+  c = applySaturation(c);
+  c = applyVibrance(c);
+  c = applyContrast(c);
+  gl_FragColor = vec4(c, 1.0);
+}
+  `
+}
+
 
 // ===== Radial Reveal (wave) =====
 const REVEAL_DURATION_MS = 1000;   // total time for ring to reach model bounds
@@ -94,12 +159,15 @@ const DRACO_PATH = `${BASE}draco/`
 const SHADOW_MAP_SIZE  = 1024// 1024–2048 is a good range for mobile
 const SHADOW_RADIUS    = 100   // VSM blur radius or PCFSoft softness hint
 // Contact shadow shaping (tweak to taste)
-const SHADOW_BASE_OPACITY   = .9  // actual received shadow
-const SHADOW_CORE_OPACITY   = 1000 // extra darkening in the center
+const SHADOW_BASE_OPACITY   = .5  // actual received shadow
+const SHADOW_CORE_OPACITY   = 0 // extra darkening in the center
 const SHADOW_CORE_SCALE     = 0 // 0..1 of disc for the core
 const SHADOW_FEATHER_OPAC   = 0 // very soft outer penumbra
 const SHADOW_FEATHER_INNER  = 0 // where feather starts (0..1 radius)
 const SHADOW_FEATHER_OUTER  = 0 // where feather ends
+
+
+let lggPass: any = null
 
 // Tweakables for initial zoom
 const INITIAL_FRAME_PADDING = 1.3
@@ -107,20 +175,21 @@ const INITIAL_ZOOM_FACTOR   =1.5
 
 export type InitOptions = {
   // Ground visuals
-  groundStyle?: 'full' | 'invisible'   // default: 'invisible'
-  reflectOpacity?: number              // 0..1, default: 0.14 (reflection only, no base)
+  groundStyle?: 'full' | 'invisible'
+  reflectOpacity?: number
 
   // Lighting
-  lightRig?: 'mobile' | 'none' // default: 'mobile'
-  envIntensity?: number        // default: 1.15 (PBR reflections)
-  backdropColor?: number | string // default: 0xf5f7fb
-  useACES?: boolean            // default: true
+  lightRig?: 'mobile' | 'none'
+  envIntensity?: number
+  backdropColor?: number | string
+  useACES?: boolean
 
-  // New shadow controls
-  enableShadows?: boolean      // default: true on capable devices
-  shadowOpacity?: number       // default: 0.35
-  shadowMapSize?: number       // default: 1536
+  // Shadows
+  enableShadows?: boolean
+  shadowOpacity?: number
+  shadowMapSize?: number
 
+  // Misc
   scrollScrub?: boolean
   modelUrl?: string
   hdriUrl?: string
@@ -130,9 +199,36 @@ export type InitOptions = {
   bloomThreshold?: number
   bloomStrength?: number
   bloomRadius?: number
+
+  // Initial grading
+  toneInit?: {
+    exposure?: number
+    lift?: [number, number, number]
+    gamma?: [number, number, number]
+    gain?: [number, number, number]
+    warmth?: number
+    saturation?: number
+    vibrance?: number
+    contrast?: number
+    curve?: 'ACES' | 'Reinhard' | 'Linear' | 'Cineon' | 'None'
+  }
 }
 
+export type ToneOpts = {
+  exposure?: number
+  lift?: [number, number, number]
+  gamma?: [number, number, number]
+  gain?: [number, number, number]
+  warmth?: number
+  saturation?: number
+  vibrance?: number
+  contrast?: number
+  curve?: 'ACES' | 'Reinhard' | 'Linear' | 'Cineon' | 'None'
+}
+
+
 export type ViewerHandle = {
+  setTone: (opts: ToneOpts) => void
   setOrbitTargetByName: (name: string | null, zoomScale?: number) => boolean
   setBlur: (amountPx: number) => void
   setVisibleIndices: (indices: number[] | null) => void
@@ -230,7 +326,7 @@ let playbackSpeed = 1.0
 let explodeState: 0 | 1 = 0
 
 // ===== Smooth zoom for exploded view =====
-const EXPLODED_ZOOM_FACTOR = 2
+const EXPLODED_ZOOM_FACTOR = 1.2
 const EXPLODED_ZOOM_MS = 380
 let _explodedZoomApplied = false
 let _zoomAnimRAF: number | null = null
@@ -413,12 +509,12 @@ function addMobileLightRig() {
   const useShadows = !!(initOpts.enableShadows)
 
   // Soft ambient (sky/ground), cheap and stable
-  const hemi = new THREE.HemisphereLight(0xffffff, 0x1a1a1a, 0.1)
+  const hemi = new THREE.HemisphereLight(0xF5E2C1, 0xF5E2C1, 0.4)
   hemi.position.set(0, 1, 0)
-  //scene.add(hemi)
+  scene.add(hemi)
 
   // Key (main directional)
-  const key = new THREE.DirectionalLight(0xffffff, 1)
+  const key = new THREE.DirectionalLight(0xF5E2C1, .3)
   key.position.set(2, 1.8, 2.8)
   keyLight = key 
   scene.add(key)
@@ -443,21 +539,22 @@ function addMobileLightRig() {
   key.shadow.bias = -0.0002
 
   // SOFTNESS: VSM uses blurSamples; PCFSoft uses radius
-    ;(key.shadow as any).radius =25   // PCFSoft fallback
+    ;(key.shadow as any).radius = 25   // PCFSoft fallback
 }
 
 
 
   // Rim / kicker from behind
-  const rim = new THREE.DirectionalLight(0xffffff, 2)
+  const rim = new THREE.DirectionalLight(0xffffff, 3)
   rim.position.set(-2.2,1, -3.2)
   rim.castShadow = false
   scene.add(rim)
 
   // Gentle fill near camera (keeps faces from going black at glancing angles)
-  const fill = new THREE.DirectionalLight(0xffffff, 1)
+  const fill = new THREE.DirectionalLight(0xffffff, 0.5)
   fill.position.set(0, 1.1, 2.8)
   scene.add(fill)
+
 
   key.color.setRGB(1.0, 0.96, 0.90)   // warm key
   rim.color.setRGB(0.85, 0.95, 1.0)   // cool rim
@@ -493,10 +590,10 @@ async function loadHDRIToEnv(url: string, showBackground: boolean) {
 }
 function addStudioBackdrop() {
   if (!scene) return
-  const col = (initOpts.backdropColor ?? 0xf5f7fb) as any
+  const col = (initOpts.backdropColor ?? 0xF5E2C1) as any
 
   const geo = new THREE.SphereGeometry(50, 64, 64)
-  const mat = new THREE.MeshStandardMaterial({ color: col, roughness: 0.98, metalness: 0.0, side: THREE.BackSide })
+  const mat = new THREE.MeshStandardMaterial({ color: col, roughness: 1, metalness: 0.0, side: THREE.BackSide })
   const mesh = new THREE.Mesh(geo, mat)
   ;(mesh.material as THREE.MeshStandardMaterial).depthWrite = false
   mesh.receiveShadow = false
@@ -626,16 +723,17 @@ function centerRootUnderPivot(root: THREE.Object3D) {
 
 // ---------- Public init
 export async function initViewer(container: HTMLElement, opts: InitOptions = {}): Promise<ViewerHandle> {
-  initOpts = { lightRig: 'mobile', envIntensity: 0.02, backdropColor: 0xdbccaf, useACES: true, enableShadows: false, groundStyle: 'invisible', ...opts }
+  initOpts = { lightRig: 'mobile', envIntensity: 0.02, backdropColor: 0xF5E2C1, useACES: true, enableShadows: false, groundStyle: 'invisible', ...opts }
   mountEl = container
+  
 
   // Renderer (mobile-lean)
-  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance', stencil: false, depth: true, preserveDrawingBuffer: false })
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'high-performance', stencil: false, depth: true, preserveDrawingBuffer: false })
 
   // Color management & tonemapping (mobile-friendly studio look)
   renderer.outputColorSpace = THREE.SRGBColorSpace as any
   renderer.toneMapping = (opts.useACES ?? true) ? THREE.ACESFilmicToneMapping : THREE.NoToneMapping
-  renderer.toneMappingExposure = (initOpts.toneMappingExposure ?? 1.05)
+  renderer.toneMappingExposure = (initOpts.toneMappingExposure ?? 1)
 
   // Shadows
   if (initOpts.enableShadows) {
@@ -664,7 +762,7 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
     if (hBlurPass?.uniforms?.h) hBlurPass.uniforms.h.value = blurAmountPx / w
     if (vBlurPass?.uniforms?.v) vBlurPass.uniforms.v.value = blurAmountPx / h
   }
-  sizeToContainer()
+
   const ro = new ResizeObserver(sizeToContainer)
   ro.observe(container)
   window.addEventListener('orientationchange', sizeToContainer)
@@ -676,7 +774,7 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
   // Scene + Camera
   scene = new THREE.Scene()
   scene.background = new THREE.Color(0xffffff)
-  camera = new THREE.PerspectiveCamera(50, 1, 0.01, 20000)
+  camera = new THREE.PerspectiveCamera(35, 1, 0.01, 20000)
   camera.position.set(1.5, 1, 3)
   scene.add(camera)
 
@@ -697,26 +795,51 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
 
   // PostFX
   composer = new EffectComposer(renderer)
-  renderPass = new RenderPass(scene, camera)
-  composer.addPass(renderPass)
 
-  hBlurPass = new ShaderPass(HorizontalBlurShader)
-  vBlurPass = new ShaderPass(VerticalBlurShader)
-  hBlurPass.enabled = false; vBlurPass.enabled = false
-  composer.addPass(hBlurPass); composer.addPass(vBlurPass)
-
+  composer.addPass(new RenderPass(scene, camera))
+  
+  lggPass = new ShaderPass(LggWarmthShader)
+  composer.addPass(lggPass)
+  
+  if (initOpts.toneInit) {
+    const t = initOpts.toneInit
+    if (t.curve) {
+      renderer.toneMapping =
+        t.curve === 'ACES'     ? THREE.ACESFilmicToneMapping :
+        t.curve === 'Reinhard' ? THREE.ReinhardToneMapping :
+        t.curve === 'Cineon'   ? THREE.CineonToneMapping :
+        t.curve === 'Linear'   ? THREE.LinearToneMapping :
+                                 THREE.NoToneMapping
+    }
+    if (typeof t.exposure   === 'number') renderer.toneMappingExposure = t.exposure
+    if (t.lift)   lggPass.uniforms.uLift.value.set(...t.lift)
+    if (t.gamma)  lggPass.uniforms.uGamma.value.set(...t.gamma)
+    if (t.gain)   lggPass.uniforms.uGain.value.set(...t.gain)
+    if (typeof t.warmth     === 'number') lggPass.uniforms.uWarmth.value     = t.warmth
+    if (typeof t.saturation === 'number') lggPass.uniforms.uSaturation.value = t.saturation
+    if (typeof t.vibrance   === 'number') lggPass.uniforms.uVibrance.value   = t.vibrance
+    if (typeof t.contrast   === 'number') lggPass.uniforms.uContrast.value   = t.contrast
+  }
+  
+  
   bloomPass = new UnrealBloomPass(new THREE.Vector2(1, 1),
-    initOpts.bloomStrength ?? .15,
-    initOpts.bloomRadius   ?? 1,
-    initOpts.bloomThreshold?? 0
+    initOpts.bloomStrength ?? 0.12,
+    initOpts.bloomRadius   ?? 0.6,
+    initOpts.bloomThreshold?? 0.72
   )
   bloomPass.enabled = opts.bloomEnabled ?? true
   composer.addPass(bloomPass)
-
-  outputPass = new OutputPass(); composer.addPass(outputPass)
-  renderer.setClearColor(0x0b1220, 1)
-  scene.background = new THREE.Color(0x0b1220)
-
+  // Vignette (after grading + bloom, before output)
+const vignettePass = new ShaderPass(VignetteShader)
+vignettePass.uniforms['offset'].value = 1.1   // 0.0..2.0 (higher = tighter edges)
+vignettePass.uniforms['darkness'].value = 1 // 0.0..1.0  (how dark the corners get)
+composer.addPass(vignettePass)
+  
+  outputPass = new OutputPass()
+  composer.addPass(outputPass)
+  sizeToContainer()
+  
+  
   // Reticle (AR)
   reticle = createReticle(); scene.add(reticle)
 
@@ -731,42 +854,6 @@ export async function initViewer(container: HTMLElement, opts: InitOptions = {})
   // Animate
   const clock = new THREE.Clock()
   const renderFrame = () => {
-
-    const renderFrame = () => {
-      // ---- radial reveal update
-      if (revealActive && pivot) {
-        const keepGoing = _updateReveal(pivot, performance.now())
-        if (!keepGoing) {
-          revealActive = false
-          _removeReveal(pivot)
-          if (controls) controls.autoRotate = autoRotateEnabled
-        }
-      }
-    
-      const dt = clock.getDelta()
-      if (controls) { const lerpAmt = 1 - Math.pow(1 - TARGET_LERP, dt * 60); controls.target.lerp(target_desired, lerpAmt); controls.update() }
-      if (mixer) mixer.update(dt * playbackSpeed)
-      if (modelSpinEnabled && pivot) pivot.rotation.y += modelSpinSpeed * dt
-      if (groundFollow) updateGroundHeightFromBBox()
-    
-      // ✅ SSS: update light direction every frame
-      if (_sssEnabled && keyLight && _sssUniformPools.length) {
-        keyLight.updateMatrixWorld(true)
-        keyLight.target.updateMatrixWorld(true)
-        _tmpLPos.setFromMatrixPosition(keyLight.matrixWorld)
-        _tmpLTgt.setFromMatrixPosition(keyLight.target.matrixWorld)
-        _tmpLDir.copy(_tmpLPos).sub(_tmpLTgt).normalize()
-        for (let i = 0; i < _sssUniformPools.length; i++) {
-          const u = _sssUniformPools[i]
-          if (u?.uLightDir) u.uLightDir.value.copy(_tmpLDir)
-        }
-      }
-    
-      if ((renderer as any)?.xr?.isPresenting) renderer!.render(scene!, camera!)
-      else if (composer) composer.render()
-      else renderer!.render(scene!, camera!)
-    }
-    
     // ---- radial reveal update
     if (revealActive && pivot) {
       const keepGoing = _updateReveal(pivot, performance.now())
@@ -807,7 +894,33 @@ if (_sssEnabled && keyLight && _sssUniformPools.length) {
   await loadGLB(opts.modelUrl ?? DEFAULT_MODEL_URL)
   target_desired.copy(centroid)
 
+
+
+
+
+
+
   return {
+    setTone: (opts) => {
+      if (!renderer || !lggPass) return
+  
+      if (opts.curve) {
+        renderer.toneMapping =
+          opts.curve === 'ACES'     ? THREE.ACESFilmicToneMapping :
+          opts.curve === 'Reinhard' ? THREE.ReinhardToneMapping :
+          opts.curve === 'Cineon'   ? THREE.CineonToneMapping :
+          opts.curve === 'Linear'   ? THREE.LinearToneMapping :
+                                      THREE.NoToneMapping
+      }
+  
+      if (typeof opts.exposure === 'number') renderer.toneMappingExposure = opts.exposure
+      if (opts.lift)  lggPass.uniforms.uLift.value.set(...opts.lift)
+      if (opts.gamma) lggPass.uniforms.uGamma.value.set(...opts.gamma)
+      if (opts.gain)  lggPass.uniforms.uGain.value.set(...opts.gain)
+      if (typeof opts.warmth === 'number') lggPass.uniforms.uWarmth.value = opts.warmth
+    },
+
+    
     setOrbitTargetByName: (name: string | null) => { if (!controls) return false; if (!name) { target_desired.copy(centroid); return true } const pos = getWorldPosByName(name); if (!pos) return false; target_desired.copy(pos); return true },
     setVisibleIndices: (indices: number[] | null) => applyVisibilityMask(indices),
     setBlur: (amountPx: number) => { blurAmountPx = Math.max(0, amountPx | 0); if (!renderer || !composer) return; const size = renderer.getSize(new THREE.Vector2()); const w = Math.max(1, size.x); const h = Math.max(1, size.y); const on = blurAmountPx > 0; if (hBlurPass && vBlurPass) { hBlurPass.enabled = on; vBlurPass.enabled = on; if (on) { hBlurPass.uniforms.h.value = blurAmountPx / w; vBlurPass.uniforms.v.value = blurAmountPx / h } } },
@@ -896,7 +1009,7 @@ function addReflectiveGround(y: number) {
   // 1) BASE SHADOW CATCHER — receives the real light shadow
   shadowCatcher = new THREE.Mesh(
     new THREE.CircleGeometry(radius * 1, segs),
-    new THREE.ShadowMaterial({ opacity: SHADOW_BASE_OPACITY, color: 0x252525})
+    new THREE.ShadowMaterial({ opacity: SHADOW_BASE_OPACITY, color: 0x826F5C})
   )
   shadowCatcher.rotateX(-Math.PI / 2)
   shadowCatcher.position.set(0, y + 0.00012, 0)
@@ -1071,6 +1184,7 @@ async function loadGLB(fileOrUrl: File | string) {
   groundBaseY = bbox.min.y - GROUND_PAD
   addReflectiveGround(groundBaseY)
 }
+
 function _injectSSSShader(m: any, opts: SSSOpts = {}) {
   if (!m || m.userData?.__sssPatched) return
   m.userData ??= {}
