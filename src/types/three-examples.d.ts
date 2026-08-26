@@ -1,4 +1,6 @@
 declare module 'three/examples/jsm/*';
+// src/declarations.d.ts
+declare module '@mkkellogg/gaussian-splats-3d';
 
 // Basic ambient typings for Three examples & GLTF loader
 declare module 'three/examples/jsm/controls/OrbitControls.js' {
