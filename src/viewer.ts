@@ -154,7 +154,7 @@ let revealMaxR   = 1
 let revealCenterW = new THREE.Vector3()
 
 const BASE = (import.meta as any).env?.BASE_URL ?? '/'
-const DEFAULT_MODEL_URL = `${BASE}assets/bed_proxy.glb`
+const DEFAULT_MODEL_URL = `${BASE}assets/bed_o.glb`
 const DRACO_PATH = `${BASE}draco/`
 
 const SHADOW_BASE_OPACITY   = 0.5
